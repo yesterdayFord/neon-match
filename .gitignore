@@ -1,0 +1,7 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+*.exe
+*.pdb
+*.ilk
+.DS_Store
