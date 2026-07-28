@@ -38,6 +38,9 @@ The canonical Zig guide has not been written yet. For now, treat those files as 
 - Keep matching behavior deterministic and covered by fixtures.
 - Preserve a simple reference path for validating optimized code.
 - Treat order book state transitions as behavioral changes that require tests.
+- Follow the Zig testing guidance in `neon-match.md`: prefer current idiomatic Zig practice, distinguish language guidance from project preferences, and keep test layout decisions deliberate.
+- Follow the Zig project structure guidance in `neon-match.md`: prefer the smallest truthful executable shape and avoid library topology until it solves a present problem.
+- Follow the Zig allocation and lifetime guidance in `neon-match.md`: treat allocation as an architectural choice, keep ownership explicit, and keep allocation-free components allocation-free.
 - Prefer explicit names for price, quantity, side, order id, and time-priority concepts.
 - Document benchmark results separately from correctness claims.
 
