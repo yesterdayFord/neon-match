@@ -23,6 +23,42 @@ This file is a portable project-local snapshot. The repository must not require 
 
 The canonical project brief is [neon-match.md](neon-match.md). Keep goals, principles, scope, roadmap, and non-goals there.
 
+## Engineering Review
+
+Every review begins with inspection, not recollection.
+
+Memory provides context. Inspection establishes truth.
+
+The current repository, document, design, or other engineering artifact is the authoritative source for its present state. Prior conversation and historical discussion are supporting context, not evidence.
+
+When reviewing work:
+
+- Inspect before drawing conclusions.
+- Separate verified observations from inferred conclusions.
+- Clearly distinguish historical context from current state.
+- Separate observation from recommendation.
+- Do not modify the artifact while reviewing unless explicitly instructed.
+
+Engineering reviews exist to improve understanding before changing the system.
+
+## Durable Engineering Decisions
+
+Conversation is transient. Repository policy is durable.
+
+When a discussion establishes a reusable engineering rule, workflow, architectural principle, coding standard, review protocol, or other long-lived guidance that is expected to influence future work, determine whether it should become part of the project's permanent documentation.
+
+Do not assume important decisions will be preserved by conversational memory.
+
+If a decision appears durable:
+
+- Recommend the appropriate canonical location.
+- Explain why it belongs there.
+- Ask whether the project documentation should be updated, or prepare a proposed patch when requested.
+
+Do not automatically modify project documentation without explicit instruction.
+
+Temporary implementation discussions, debugging sessions, exploratory ideas, and one-off preferences should remain conversational unless they evolve into project policy.
+
 ## Shared Engineering Guidance
 
 NeonMatch consumes Groot's canonical VIHO guidance as shared engineering guidance, currently targeting VIHO `0.3.0`:
