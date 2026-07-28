@@ -23,6 +23,24 @@ This file is a portable project-local snapshot. The repository must not require 
 
 The canonical project brief is [neon-match.md](neon-match.md). Keep goals, principles, scope, roadmap, and non-goals there.
 
+## Shared Engineering Guidance
+
+NeonMatch consumes Groot's canonical VIHO guidance as shared engineering guidance, currently targeting VIHO `0.3.0`:
+
+- Canonical document: <https://github.com/yesterdayFord/groot/blob/main/engineering/principles/viho.md>
+- Raw document: <https://raw.githubusercontent.com/yesterdayFord/groot/main/engineering/principles/viho.md>
+
+Before architectural or performance-sensitive work, retrieve and read the canonical VIHO document. If it cannot be retrieved, report that clearly instead of using a remembered or cached version.
+
+Do not copy, vendor, summarize, or maintain a local `viho.md`. VIHO is shared guidance: explicit NeonMatch requirements and repository-local instructions take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
+
+VIHO adoption policy:
+
+- Patch revisions may be adopted immediately.
+- Minor revisions should be adopted at a clean boundary, normally after a clean merge.
+- Major revisions require explicit review and a migration decision. They may require validation in a separate real project before NeonMatch adopts them.
+- Never interrupt active work merely because VIHO changed.
+
 ## Zig Guidance Snapshot
 
 Copied guidance lives under `docs/agent/`:
