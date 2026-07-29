@@ -40,8 +40,7 @@ pub fn main() !void {
     }
 }
 
-
-fn applyCommandEvent(
+pub fn applyCommandEvent(
     writer: *std.Io.Writer,
     book: *engine.OrderBook,
     event: CommandEvent,
