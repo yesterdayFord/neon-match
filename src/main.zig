@@ -1,16 +1,9 @@
 const std = @import("std");
 const engine = @import("engine.zig");
 
-const Command = union(enum) {
-    buy: InputOrder,
-    sell: InputOrder,
+pub const CommandEvent = union(enum) {
+    submit_limit: engine.Order,
     cancel: engine.OrderId,
-};
-
-const InputOrder = struct {
-    id: engine.OrderId,
-    price: engine.Price,
-    quantity: engine.Quantity,
 };
 
 pub fn main() !void {
@@ -33,55 +26,39 @@ pub fn main() !void {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
 
-        const parsed = parseCommand(trimmed) catch |err| {
+        const event = parseCommandEvent(trimmed) catch |err| {
             try stdout.print("ERROR {s}\n", .{@errorName(err)});
             try printState(stdout, &book);
             try stdout.flush();
             continue;
         };
 
-        switch (parsed) {
-            .buy => |input| {
-                const order: engine.Order = .{
-                    .id = input.id,
-                    .side = .buy,
-                    .price = input.price,
-                    .quantity = input.quantity,
-                };
-                if (!try canAccept(stdout, &book, order)) {
-                    try printState(stdout, &book);
-                    try stdout.flush();
-                    continue;
-                }
-                const result = book.submitLimit(order);
-                try printTrades(stdout, &result);
-            },
-            .sell => |input| {
-                const order: engine.Order = .{
-                    .id = input.id,
-                    .side = .sell,
-                    .price = input.price,
-                    .quantity = input.quantity,
-                };
-                if (!try canAccept(stdout, &book, order)) {
-                    try printState(stdout, &book);
-                    try stdout.flush();
-                    continue;
-                }
-                const result = book.submitLimit(order);
-                try printTrades(stdout, &result);
-            },
-            .cancel => |id| {
-                if (book.cancel(id)) {
-                    try stdout.print("CANCELED {d}\n", .{id});
-                } else {
-                    try stdout.print("NOT_FOUND {d}\n", .{id});
-                }
-            },
-        }
+        try applyCommandEvent(stdout, &book, event);
 
         try printState(stdout, &book);
         try stdout.flush();
+    }
+}
+
+
+fn applyCommandEvent(
+    writer: *std.Io.Writer,
+    book: *engine.OrderBook,
+    event: CommandEvent,
+) !void {
+    switch (event) {
+        .submit_limit => |order| {
+            if (!try canAccept(writer, book, order)) return;
+            const result = book.submitLimit(order);
+            try printTrades(writer, &result);
+        },
+        .cancel => |id| {
+            if (book.cancel(id)) {
+                try writer.print("CANCELED {d}\n", .{id});
+            } else {
+                try writer.print("NOT_FOUND {d}\n", .{id});
+            }
+        },
     }
 }
 
@@ -119,20 +96,20 @@ fn readLine(reader: *std.Io.Reader, buffer: []u8) !?[]const u8 {
     }
 }
 
-fn parseCommand(line: []const u8) !Command {
+fn parseCommandEvent(line: []const u8) !CommandEvent {
     var tokens = std.mem.tokenizeAny(u8, line, " \t\r\n");
     const verb = tokens.next() orelse return error.EmptyCommand;
 
     if (std.mem.eql(u8, verb, "BUY")) {
-        const order = try parseInputOrder(&tokens);
+        const order = try parseInputOrder(&tokens, .buy);
         if (tokens.next() != null) return error.TooManyFields;
-        return .{ .buy = order };
+        return .{ .submit_limit = order };
     }
 
     if (std.mem.eql(u8, verb, "SELL")) {
-        const order = try parseInputOrder(&tokens);
+        const order = try parseInputOrder(&tokens, .sell);
         if (tokens.next() != null) return error.TooManyFields;
-        return .{ .sell = order };
+        return .{ .submit_limit = order };
     }
 
     if (std.mem.eql(u8, verb, "CANCEL")) {
@@ -144,13 +121,14 @@ fn parseCommand(line: []const u8) !Command {
     return error.UnknownCommand;
 }
 
-fn parseInputOrder(tokens: *std.mem.TokenIterator(u8, .any)) !InputOrder {
+fn parseInputOrder(tokens: *std.mem.TokenIterator(u8, .any), side: engine.Side) !engine.Order {
     const id_text = tokens.next() orelse return error.MissingOrderId;
     const price_text = tokens.next() orelse return error.MissingPrice;
     const quantity_text = tokens.next() orelse return error.MissingQuantity;
 
     return .{
         .id = try parsePositive(engine.OrderId, id_text),
+        .side = side,
         .price = try parsePositive(engine.Price, price_text),
         .quantity = try parsePositive(engine.Quantity, quantity_text),
     };
@@ -190,11 +168,30 @@ fn printState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
     }
 }
 
-test "parse buy command" {
-    const command = try parseCommand("BUY 1 100 10");
-    try std.testing.expectEqual(@as(engine.OrderId, 1), command.buy.id);
-    try std.testing.expectEqual(@as(engine.Price, 100), command.buy.price);
-    try std.testing.expectEqual(@as(engine.Quantity, 10), command.buy.quantity);
+test "stdin command produces a command event" {
+    const event = try parseCommandEvent("BUY 1 100 10");
+    const order = event.submit_limit;
+
+    try std.testing.expectEqual(engine.Side.buy, order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), order.id);
+    try std.testing.expectEqual(@as(engine.Price, 100), order.price);
+    try std.testing.expectEqual(@as(engine.Quantity, 10), order.quantity);
+}
+
+test "command event can be applied without stdin" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    const event: CommandEvent = .{ .submit_limit = .{
+        .id = 1,
+        .side = .buy,
+        .price = 100,
+        .quantity = 10,
+    } };
+    try applyCommandEvent(&writer, &book, event);
+
+    try std.testing.expect(book.containsOrder(1));
 }
 
 test "full bid side does not reject buy that fully crosses an ask" {
