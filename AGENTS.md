@@ -1,16 +1,16 @@
 # AGENTS.md
 
 <!--
-Groot guidance snapshot:
+Engineering guidance snapshot:
 - Source: engineering/languages/zig/base.md
 - Source: engineering/languages/zig/versions/0.17.md
 - Snapshot date: 2026-07-27
-- Groot revision: unavailable
+- Source revision: unavailable
 -->
 
 These instructions apply to this repository tree.
 
-This file is a portable project-local snapshot. The repository must not require Groot, symlinks to Groot, or external language-guidance files to build, test, review, package, or submit.
+This file is a portable project-local snapshot. The repository must not require external orchestration layers, symlinks to shared guidance, or external language-guidance files to build, test, review, package, or submit.
 
 ## AGENTS.md Scope
 
@@ -61,12 +61,9 @@ Temporary implementation discussions, debugging sessions, exploratory ideas, and
 
 ## Shared Engineering Guidance
 
-NeonMatch consumes Groot's canonical VIHO guidance as shared engineering guidance, currently targeting VIHO `0.3.0`:
+NeonMatch consumes canonical VIHO guidance from `engineering/principles/viho.md` as shared engineering guidance, currently targeting VIHO `0.3.0`.
 
-- Canonical document: <https://github.com/yesterdayFord/groot/blob/main/engineering/principles/viho.md>
-- Raw document: <https://raw.githubusercontent.com/yesterdayFord/groot/main/engineering/principles/viho.md>
-
-Before architectural or performance-sensitive work, retrieve and read the canonical VIHO document. If it cannot be retrieved, report that clearly instead of using a remembered or cached version.
+Before architectural or performance-sensitive work, retrieve and read the canonical VIHO document from `engineering/principles/viho.md`. If it cannot be retrieved, report that clearly instead of using a remembered or cached version.
 
 Do not copy, vendor, summarize, or maintain a local `viho.md`. VIHO is shared guidance: explicit NeonMatch requirements and repository-local instructions take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
 
@@ -84,7 +81,7 @@ Copied guidance lives under `docs/agent/`:
 - `docs/agent/zig.md`
 - `docs/agent/zig-0.17.md`
 
-The canonical Zig guide has not been written yet. For now, treat those files as placeholders for copied Zig-wide guidance once Groot establishes it. Do not infer extra Zig standards from the existence of the placeholders.
+The canonical Zig guide has not been written yet. For now, treat those files as placeholders for copied Zig-wide guidance once it is established under `engineering/languages/zig/`. Do not infer extra Zig standards from the existence of the placeholders.
 
 ## Matching Engine Project Guidance
 
@@ -100,6 +97,6 @@ The canonical Zig guide has not been written yet. For now, treat those files as 
 
 ## Portability
 
-- Do not add symlinks to Groot.
-- Do not require Groot paths in build scripts, tests, editor settings, or CI.
-- If language guidance is refreshed from Groot, update the snapshot metadata above.
+- Do not add symlinks to shared engineering guidance.
+- Do not require shared `engineering/` paths in build scripts, tests, editor settings, or CI.
+- If language guidance is refreshed from `engineering/`, update the snapshot metadata above.

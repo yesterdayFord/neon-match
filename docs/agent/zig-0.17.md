@@ -1,10 +1,10 @@
 # Zig 0.17 Delta
 
 <!--
-Groot guidance snapshot:
+Engineering guidance snapshot:
 - Source: engineering/languages/zig/versions/0.17.md
 - Snapshot date: 2026-07-27
-- Groot revision: unavailable
+- Source revision: unavailable
 -->
 
 This file is reserved for Zig 0.17-specific guidance.
