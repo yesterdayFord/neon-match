@@ -19,6 +19,12 @@ NeonMatch is a small, explicit, deterministic matching-engine project. Its purpo
 - Benchmarks should describe performance observations, not replace correctness tests.
 - Project documentation should have one canonical home for each kind of knowledge.
 
+## MVP Status
+
+The MVP is complete once `CommandEvent` is merged into `main`: the project has a deterministic fixed-capacity matching engine, stdin command handling, a direct command-event boundary, fixture-backed replay coverage, and focused tests for order acceptance, cancellation, matching, and capacity edges.
+
+The first post-MVP increment is durable journaling. Treat event logs, replay beyond the current deterministic fixtures, and audit-oriented storage as post-MVP work.
+
 ## Zig Testing Guidance
 
 Follow current Zig best practices while recognizing that the language, tooling, build system, and community conventions continue to evolve.
@@ -127,8 +133,9 @@ Initial scope includes:
 - Deterministic fixtures for order book transitions.
 - A concise operational README and project-local agent guidance.
 
-Future scope may include:
+Post-MVP scope may include:
 
+- Durable journaling as the first post-MVP increment.
 - Market orders or additional order types.
 - Performance benchmarks.
 - Alternative optimized data structures.
@@ -137,12 +144,13 @@ Future scope may include:
 
 ## Roadmap
 
-1. Establish the project scaffold, brief, local guidance, build file, and empty library entry point.
-2. Define the core domain vocabulary: side, price, quantity, order id, timestamp or sequence, order, trade, and book state.
-3. Implement a simple reference matcher with focused unit tests.
-4. Add deterministic fixtures for representative matching and cancellation scenarios.
-5. Measure baseline performance only after behavior is covered by tests.
-6. Introduce optimized structures only when the reference path can validate them.
+1. Complete: establish the project scaffold, brief, local guidance, build file, and executable entry point.
+2. Complete: define the core domain vocabulary: side, price, quantity, order id, order, trade, and book state.
+3. Complete: implement a simple reference matcher with focused unit tests.
+4. Complete: add deterministic fixtures and direct `CommandEvent` replay for representative matching and cancellation scenarios.
+5. Post-MVP: add durable journaling as the first new increment.
+6. Post-MVP: measure baseline performance only after behavior is covered by tests.
+7. Post-MVP: introduce optimized structures only when the reference path can validate them.
 
 ## Non-Goals
 

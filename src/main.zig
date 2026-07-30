@@ -259,37 +259,12 @@ test "direct command event replay matches stdin fixture output" {
         try printState(&writer, &book);
     }
 
-    try expectOutput(
-        &writer,
-        "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n" ++
-            "BOOK\n" ++
-            "  BIDS\n" ++
-            "    id=1 price=100 quantity=10\n" ++
-            "  ASKS\n" ++
-            "BOOK\n" ++
-            "  BIDS\n" ++
-            "    id=1 price=100 quantity=10\n" ++
-            "  ASKS\n" ++
-            "    id=2 price=110 quantity=5\n" ++
-            "TRADE maker=1 taker=3 price=100 quantity=4\n" ++
-            "BOOK\n" ++
-            "  BIDS\n" ++
-            "    id=1 price=100 quantity=6\n" ++
-            "  ASKS\n" ++
-            "    id=2 price=110 quantity=5\n" ++
-            "TRADE maker=2 taker=4 price=110 quantity=5\n" ++
-            "BOOK\n" ++
-            "  BIDS\n" ++
-            "    id=4 price=110 quantity=3\n" ++
-            "    id=1 price=100 quantity=6\n" ++
-            "  ASKS\n" ++
-            "NOT_FOUND 2\n" ++
-            "BOOK\n" ++
-            "  BIDS\n" ++
-            "    id=4 price=110 quantity=3\n" ++
-            "    id=1 price=100 quantity=6\n" ++
-            "  ASKS\n",
-    );
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var expected_buffer: [2048]u8 = undefined;
+    const expected_file = try std.Io.Dir.cwd().openFile(io, "tests/fixtures/basic.stdout", .{});
+    defer expected_file.close(io);
+    const expected_len = try expected_file.readPositionalAll(io, &expected_buffer, 0);
+    try expectOutput(&writer, expected_buffer[0..expected_len]);
     try std.testing.expectEqual(@as(usize, 2), book.bid_count);
     try std.testing.expectEqual(@as(engine.OrderId, 4), book.bids[0].id);
     try std.testing.expectEqual(@as(engine.Quantity, 3), book.bids[0].quantity);
