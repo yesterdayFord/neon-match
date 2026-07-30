@@ -59,6 +59,12 @@ Do not automatically modify project documentation without explicit instruction.
 
 Temporary implementation discussions, debugging sessions, exploratory ideas, and one-off preferences should remain conversational unless they evolve into project policy.
 
+## GitHub Operations
+
+Use the connected GitHub integration for GitHub operations when practical.
+
+When local Git is required for working-tree state, rebases, merges, commits, or exact ref handling, use local Git directly. If the managed sandbox blocks `.git` writes or Git-for-Windows SSH transport, request escalation and complete the operation rather than asking the user to run it manually.
+
 ## Shared Engineering Guidance
 
 NeonMatch consumes canonical VIHO guidance from `engineering/principles/viho.md` as shared engineering guidance, currently targeting VIHO `0.3.0`.
