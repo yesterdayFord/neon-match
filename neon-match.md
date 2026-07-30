@@ -25,6 +25,101 @@ The MVP is complete once `CommandEvent` is merged into `main`: the project has a
 
 The first post-MVP increment is durable journaling. Treat event logs, replay beyond the current deterministic fixtures, and audit-oriented storage as post-MVP work.
 
+## Journaling Guidance
+
+The journal preserves the ordered input truth of the engine.
+
+The command journal is authoritative. Trades, errors, and book state are deterministic consequences that can be regenerated.
+
+Live and replay differ only in where the next `CommandEvent` comes from.
+
+NeonMatch stores journals in a configurable runtime directory as append-only `.nmj` segments. Each engine start creates a new UTC-named segment. Segment and record order, not timestamps, define command order. Closed segments are immutable and replayed in sequence.
+
+General rules:
+
+- Journal parsed `CommandEvent` values, not stdin text and not derived book state.
+- Append each valid command before it may mutate the book.
+- Use one append-only, single-writer binary stream.
+- Preserve exact command order.
+- Replay journaled commands through the same application path used during live execution.
+- Treat trades, errors, and final book state as deterministic outputs that can be regenerated.
+- A journal write failure must prevent the corresponding command from executing.
+- Verify replay by comparing observable output and final book state with the original execution.
+
+Admission and durability:
+
+- The live admission path is `parse -> append -> apply`.
+- A command must be completely appended to the OS-managed journal before it is applied to the engine.
+- Per-command stable-storage sync is not required before applying a command.
+- Stable-storage durability is committed at controlled boundaries and during graceful shutdown.
+- Do not put a disk barrier such as per-command `fsync` on the default command path.
+- The initial guarantee is process-replayable journaling, not zero-loss recovery from sudden machine or power failure.
+- If stronger crash recovery becomes a real requirement, use batching or group commit rather than per-command sync.
+
+Runtime layout and naming:
+
+- Treat the journal as runtime data, not repository content.
+- Use `./journal/` as the development default.
+- Use a configurable absolute directory in production, conventionally `/var/lib/neon-match/journal/`.
+- Keep journal files out of `src/`; the implementation belongs in `src/journal.zig`.
+- Add `journal/` to `.gitignore`.
+- Tests must use a temporary directory, never the real journal directory.
+- Name segments `journal-<UTC-start-time>-<sequence>.nmj`, for example `journal-20260730T014500Z-000001.nmj`.
+- Use UTC only in filenames.
+- The timestamp records when the segment was created.
+- Use a zero-padded sequence to prevent collisions and preserve lexical order.
+- Do not put mutable information, such as ending time or record count, in the filename.
+
+Segment lifecycle:
+
+- The journal is logically one ordered stream composed of immutable segments.
+- For the first implementation, use one process run as one segment.
+- Open a new segment each time the engine starts.
+- Append records only.
+- Never reopen an old segment for appending.
+- Never overwrite an existing filename.
+- On collision, advance the sequence or fail safely.
+- Replay segments in timestamp-and-sequence order.
+- Add size-based rollover later, probably with a simple bound such as 256 MiB.
+- Do not use midnight as the primary rollover boundary.
+
+Date and ordering rules:
+
+- Store timestamps in UTC.
+- Do not encode local timezone, DST, or trading date into the core journal format.
+- If a business or trading date becomes useful later, derive or index it separately.
+- Ordering must come from record order and segment sequence, not wall-clock timestamps.
+
+Recovery and retention:
+
+- An open segment may be appended to but never modified in place.
+- A closed segment is immutable.
+- An incomplete final record after a crash is ignored or safely truncated during recovery.
+- Corruption before the final record is an error, not something replay silently skips.
+- Retention, archival, deletion, and compression remain outside the matching engine initially.
+
+The first journaling increment should include only:
+
+- Versioned record header.
+- Record length.
+- Serialized `CommandEvent`.
+- Checksum.
+- Journal writer.
+- Journal reader.
+- Replay test proving identical output and state.
+
+Explicitly defer:
+
+- Memory mapping.
+- Asynchronous journal threads.
+- Batching.
+- Compression.
+- Database integration.
+- Snapshots.
+- Log rotation.
+- Recovery from partially corrupted files beyond safely rejecting or truncating an incomplete final record.
+- Journaling derived trades as separate authoritative events.
+
 ## Zig Testing Guidance
 
 Follow current Zig best practices while recognizing that the language, tooling, build system, and community conventions continue to evolve.
