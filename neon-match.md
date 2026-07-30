@@ -8,7 +8,7 @@ NeonMatch is a small, explicit, deterministic matching-engine project. Its purpo
 - Model core order book behavior with clear names and testable state transitions.
 - Preserve a simple reference path for validating any future optimized path.
 - Keep correctness claims grounded in fixtures and reproducible tests.
-- Make the project portable as a standalone repository, with copied local guidance rather than runtime links back to Groot.
+- Make the project portable as a standalone repository, with copied local guidance rather than runtime links back to shared engineering guidance.
 
 ## Principles
 
@@ -149,5 +149,5 @@ Future scope may include:
 - Do not build an exchange, broker, trading bot, or production market gateway.
 - Do not optimize before the matching rules are stable and tested.
 - Do not add networking, persistence, authentication, or UI concerns during the initial scaffold phase.
-- Do not make the project depend on Groot at runtime or through symlinks.
+- Do not make the project depend on shared engineering guidance at runtime or through symlinks.
 - Do not duplicate this full brief into `README.md`; link to it instead.

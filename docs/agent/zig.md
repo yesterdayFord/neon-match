@@ -1,10 +1,10 @@
 # Zig Base Guide
 
 <!--
-Groot guidance snapshot:
+Engineering guidance snapshot:
 - Source: engineering/languages/zig/base.md
 - Snapshot date: 2026-07-27
-- Groot revision: unavailable
+- Source revision: unavailable
 -->
 
 This file is the project-local snapshot of Zig engineering guidance that applies across supported Zig versions.
@@ -13,7 +13,7 @@ This is a scaffold only. Do not treat it as an established Zig language standard
 
 ## Purpose
 
-- Reserve the project-local location for future Zig-wide engineering guidance copied from Groot.
+- Reserve the project-local location for future Zig-wide engineering guidance copied from `engineering/languages/zig/`.
 - Make future Zig project guidance portable into this standalone repository.
 - Keep language-wide rules separate from project-specific matching-engine rules.
 
