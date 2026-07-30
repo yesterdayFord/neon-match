@@ -49,6 +49,8 @@ pub const OrderBook = struct {
         return .{};
     }
 
+    // Low-level primitive for prevalidated orders. Callers must ensure the id is
+    // unique and any residual quantity can rest before invoking this mutating path.
     pub fn submitLimit(self: *OrderBook, order: Order) MatchResult {
         assert(order.quantity > 0);
         assert(self.findIndex(order.id) == null);
