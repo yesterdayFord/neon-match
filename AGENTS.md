@@ -95,6 +95,18 @@ The canonical Zig guide has not been written yet. For now, treat those files as 
 - Prefer explicit names for price, quantity, side, order id, and time-priority concepts.
 - Document benchmark results separately from correctness claims.
 
+## Zig Build/Test in Managed Sandboxes
+
+When running Zig build or test commands in a managed sandbox, redirect both Zig caches into the repository before invoking Zig:
+
+```powershell
+$env:ZIG_GLOBAL_CACHE_DIR="$PWD\.zig-global-cache"
+$env:ZIG_LOCAL_CACHE_DIR="$PWD\.zig-cache"
+zig build test
+```
+
+Zig defaults its global cache outside this workspace, which can fail with `manifest_create AccessDenied` even when Zig is installed correctly and the project builds. Do not treat that error as a toolchain/version problem unless the cache redirect still fails.
+
 ## Portability
 
 - Do not add symlinks to shared engineering guidance.

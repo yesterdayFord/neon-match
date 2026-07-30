@@ -167,48 +167,270 @@ fn printState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
     }
 }
 
-test "stdin command produces a command event" {
-    const event = try parseCommandEvent("BUY 1 100 10");
-    const order = event.submit_limit;
-
-    try std.testing.expectEqual(engine.Side.buy, order.side);
-    try std.testing.expectEqual(@as(engine.OrderId, 1), order.id);
-    try std.testing.expectEqual(@as(engine.Price, 100), order.price);
-    try std.testing.expectEqual(@as(engine.Quantity, 10), order.quantity);
+fn buy(id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
+    return .{ .submit_limit = .{ .id = id, .side = .buy, .price = price, .quantity = quantity } };
 }
 
-test "command event can be applied without stdin" {
-    var book = engine.OrderBook.init();
-    var output_buffer: [128]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output_buffer);
-
-    const event: CommandEvent = .{ .submit_limit = .{
-        .id = 1,
-        .side = .buy,
-        .price = 100,
-        .quantity = 10,
-    } };
-    try applyCommandEvent(&writer, &book, event);
-
-    try std.testing.expect(book.containsOrder(1));
+fn sell(id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
+    return .{ .submit_limit = .{ .id = id, .side = .sell, .price = price, .quantity = quantity } };
 }
 
-test "full bid side does not reject buy that fully crosses an ask" {
-    var book = engine.OrderBook.init();
+fn cancel(id: engine.OrderId) CommandEvent {
+    return .{ .cancel = id };
+}
 
-    var id: engine.OrderId = 1;
-    while (id <= engine.max_orders) : (id += 1) {
-        _ = book.submitLimit(.{ .id = id, .side = .buy, .price = 90, .quantity = 1 });
+fn expectOutput(writer: *const std.Io.Writer, expected: []const u8) !void {
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+fn expectBookUnchanged(before: *const engine.OrderBook, after: *const engine.OrderBook) !void {
+    try std.testing.expectEqual(before.bid_count, after.bid_count);
+    try std.testing.expectEqual(before.ask_count, after.ask_count);
+    try std.testing.expectEqualSlices(engine.Order, before.bids[0..before.bid_count], after.bids[0..after.bid_count]);
+    try std.testing.expectEqualSlices(engine.Order, before.asks[0..before.ask_count], after.asks[0..after.ask_count]);
+}
+
+fn fillSideWithRestingOrders(
+    writer: *std.Io.Writer,
+    book: *engine.OrderBook,
+    side: engine.Side,
+    start_id: engine.OrderId,
+) !void {
+    var offset: engine.OrderId = 0;
+    while (offset < engine.max_orders) : (offset += 1) {
+        const id = start_id + offset;
+        const event = switch (side) {
+            .buy => buy(id, 90, 1),
+            .sell => sell(id, 110, 1),
+        };
+        try applyCommandEvent(writer, book, event);
     }
-    _ = book.submitLimit(.{ .id = 200, .side = .sell, .price = 100, .quantity = 1 });
+}
 
+test "parse buy sell and cancel commands into command events" {
+    const buy_event = try parseCommandEvent("BUY 1 100 10");
+    const buy_order = buy_event.submit_limit;
+    try std.testing.expectEqual(engine.Side.buy, buy_order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), buy_order.id);
+    try std.testing.expectEqual(@as(engine.Price, 100), buy_order.price);
+    try std.testing.expectEqual(@as(engine.Quantity, 10), buy_order.quantity);
+
+    const sell_event = try parseCommandEvent("SELL 2 110 5");
+    const sell_order = sell_event.submit_limit;
+    try std.testing.expectEqual(engine.Side.sell, sell_order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 2), sell_order.id);
+    try std.testing.expectEqual(@as(engine.Price, 110), sell_order.price);
+    try std.testing.expectEqual(@as(engine.Quantity, 5), sell_order.quantity);
+
+    const cancel_event = try parseCommandEvent("CANCEL 2");
+    try std.testing.expectEqual(@as(engine.OrderId, 2), cancel_event.cancel);
+}
+
+test "buy sell and cancel events can be applied without stdin" {
+    var book = engine.OrderBook.init();
     var output_buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try std.testing.expect(try canAccept(&writer, &book, .{
-        .id = 201,
-        .side = .buy,
-        .price = 100,
-        .quantity = 1,
-    }));
+    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
+    try applyCommandEvent(&writer, &book, sell(2, 110, 5));
+    try applyCommandEvent(&writer, &book, cancel(1));
+
+    try std.testing.expect(!book.containsOrder(1));
+    try std.testing.expect(book.containsOrder(2));
+    try expectOutput(&writer, "CANCELED 1\n");
+}
+
+test "direct command event replay matches stdin fixture output" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+
+    const events = [_]CommandEvent{
+        buy(1, 100, 10),
+        sell(2, 110, 5),
+        sell(3, 100, 4),
+        buy(4, 110, 8),
+        cancel(2),
+    };
+    for (events) |event| {
+        try applyCommandEvent(&writer, &book, event);
+        try printState(&writer, &book);
+    }
+
+    try expectOutput(
+        &writer,
+        "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "    id=1 price=100 quantity=10\n" ++
+            "  ASKS\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "    id=1 price=100 quantity=10\n" ++
+            "  ASKS\n" ++
+            "    id=2 price=110 quantity=5\n" ++
+            "TRADE maker=1 taker=3 price=100 quantity=4\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "    id=1 price=100 quantity=6\n" ++
+            "  ASKS\n" ++
+            "    id=2 price=110 quantity=5\n" ++
+            "TRADE maker=2 taker=4 price=110 quantity=5\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "    id=4 price=110 quantity=3\n" ++
+            "    id=1 price=100 quantity=6\n" ++
+            "  ASKS\n" ++
+            "NOT_FOUND 2\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "    id=4 price=110 quantity=3\n" ++
+            "    id=1 price=100 quantity=6\n" ++
+            "  ASKS\n",
+    );
+    try std.testing.expectEqual(@as(usize, 2), book.bid_count);
+    try std.testing.expectEqual(@as(engine.OrderId, 4), book.bids[0].id);
+    try std.testing.expectEqual(@as(engine.Quantity, 3), book.bids[0].quantity);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book.bids[1].id);
+    try std.testing.expectEqual(@as(engine.Quantity, 6), book.bids[1].quantity);
+    try std.testing.expectEqual(@as(usize, 0), book.ask_count);
+}
+
+test "applyCommandEvent reports duplicate ids and leaves book unchanged" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
+    const before = book;
+    try applyCommandEvent(&writer, &book, buy(1, 99, 5));
+
+    try expectBookUnchanged(&before, &book);
+    try expectOutput(&writer, "ERROR DuplicateOrderId 1\n");
+}
+
+test "applyCommandEvent reports missing cancels without changing the book" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try applyCommandEvent(&writer, &book, sell(1, 110, 5));
+    const before = book;
+    try applyCommandEvent(&writer, &book, cancel(404));
+
+    try expectBookUnchanged(&before, &book);
+    try expectOutput(&writer, "NOT_FOUND 404\n");
+}
+
+test "applyCommandEvent handles partial fills and fully filled orders" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try applyCommandEvent(&writer, &book, sell(1, 100, 10));
+    try applyCommandEvent(&writer, &book, buy(2, 100, 4));
+    try std.testing.expect(book.containsOrder(1));
+    try std.testing.expectEqual(@as(engine.Quantity, 6), book.asks[0].quantity);
+
+    try applyCommandEvent(&writer, &book, buy(3, 100, 6));
+    try std.testing.expect(!book.containsOrder(1));
+    try std.testing.expectEqual(@as(usize, 0), book.ask_count);
+    try expectOutput(
+        &writer,
+        "TRADE maker=1 taker=2 price=100 quantity=4\n" ++
+            "TRADE maker=1 taker=3 price=100 quantity=6\n",
+    );
+}
+
+test "exactly max resting orders per side can be applied" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    try fillSideWithRestingOrders(&writer, &book, .sell, 1000);
+
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book.ask_count);
+    try expectOutput(&writer, "");
+}
+
+test "a resting order beyond side capacity is rejected without changing the book" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    const before_bids = book;
+    try applyCommandEvent(&writer, &book, buy(200, 89, 1));
+    try expectBookUnchanged(&before_bids, &book);
+    try expectOutput(&writer, "ERROR BookFull\n");
+
+    writer.end = 0;
+    book = engine.OrderBook.init();
+    try fillSideWithRestingOrders(&writer, &book, .sell, 1);
+    const before_asks = book;
+    try applyCommandEvent(&writer, &book, sell(200, 111, 1));
+    try expectBookUnchanged(&before_asks, &book);
+    try expectOutput(&writer, "ERROR BookFull\n");
+}
+
+test "full own side accepts an incoming order that fully crosses" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    try applyCommandEvent(&writer, &book, sell(200, 100, 1));
+    try applyCommandEvent(&writer, &book, buy(201, 100, 1));
+
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
+    try std.testing.expectEqual(@as(usize, 0), book.ask_count);
+    try expectOutput(&writer, "TRADE maker=200 taker=201 price=100 quantity=1\n");
+}
+
+test "crossing order with residual is rejected when residual cannot rest" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    try applyCommandEvent(&writer, &book, sell(200, 100, 1));
+    const before = book;
+    try applyCommandEvent(&writer, &book, buy(201, 100, 2));
+
+    try expectBookUnchanged(&before, &book);
+    try expectOutput(&writer, "ERROR BookFull\n");
+}
+
+test "canceling a resting order frees capacity for another order" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    try applyCommandEvent(&writer, &book, cancel(1));
+    try applyCommandEvent(&writer, &book, buy(200, 89, 1));
+
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
+    try std.testing.expect(!book.containsOrder(1));
+    try std.testing.expect(book.containsOrder(200));
+    try expectOutput(&writer, "CANCELED 1\n");
+}
+
+test "fully filling a resting order frees capacity for another order" {
+    var book = engine.OrderBook.init();
+    var output_buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try fillSideWithRestingOrders(&writer, &book, .buy, 1);
+    try applyCommandEvent(&writer, &book, sell(200, 90, 1));
+    try applyCommandEvent(&writer, &book, buy(201, 89, 1));
+
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
+    try std.testing.expect(!book.containsOrder(1));
+    try std.testing.expect(book.containsOrder(201));
+    try expectOutput(&writer, "TRADE maker=1 taker=200 price=90 quantity=1\n");
 }
