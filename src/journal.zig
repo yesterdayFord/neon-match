@@ -295,6 +295,28 @@ test "reader treats only an incomplete final record as a recoverable tail" {
     try std.testing.expect((try reader.next()) == null);
 }
 
+test "reader treats an incomplete final payload as a recoverable tail" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var final_record: [header_len + cancel_payload_len]u8 = undefined;
+    encodeCancelRecord(&final_record, 10);
+
+    var bytes: [header_len + cancel_payload_len + header_len + 3]u8 = undefined;
+    encodeCancelRecord(bytes[0 .. header_len + cancel_payload_len], 9);
+    @memcpy(bytes[header_len + cancel_payload_len ..][0..header_len], final_record[0..header_len]);
+    @memcpy(bytes[header_len + cancel_payload_len + header_len ..], final_record[header_len .. header_len + 3]);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail-payload.nmj", .data = &bytes });
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/tail-payload.nmj", .{tmp.sub_path[0..]});
+    var reader = try Reader.open(io, path);
+    defer reader.close();
+    try std.testing.expectEqual(@as(engine.OrderId, 9), (try reader.next()).?.cancel);
+    try std.testing.expect((try reader.next()) == null);
+}
+
 test "reader rejects corruption before the final record" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -313,6 +335,35 @@ test "reader rejects corruption before the final record" {
     try std.testing.expectError(error.InvalidJournalChecksum, reader.next());
 }
 
+test "reader validates magic version kind expected length checksum and side" {
+    var bytes: [header_len + submit_limit_payload_len]u8 = undefined;
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+
+    bytes[0] = 'X';
+    try expectReaderError(&bytes, error.InvalidJournalMagic);
+
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    bytes[4] = version + 1;
+    try expectReaderError(&bytes, error.UnsupportedJournalVersion);
+
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    bytes[5] = 99;
+    try expectReaderError(&bytes, error.InvalidJournalRecordKind);
+
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    std.mem.writeInt(u32, bytes[6..10], submit_limit_payload_len - 1, .little);
+    try expectReaderError(&bytes, error.InvalidJournalRecordLength);
+
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    std.mem.writeInt(u32, bytes[10..14], 0, .little);
+    try expectReaderError(&bytes, error.InvalidJournalChecksum);
+
+    encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    bytes[header_len] = 99;
+    std.mem.writeInt(u32, bytes[10..14], std.hash.Crc32.hash(bytes[header_len..]), .little);
+    try expectReaderError(&bytes, error.InvalidJournalSide);
+}
+
 fn encodeCancelRecord(buffer: []u8, id: engine.OrderId) void {
     std.debug.assert(buffer.len == header_len + cancel_payload_len);
     @memcpy(buffer[0..4], magic);
@@ -321,4 +372,34 @@ fn encodeCancelRecord(buffer: []u8, id: engine.OrderId) void {
     std.mem.writeInt(u32, buffer[6..10], cancel_payload_len, .little);
     std.mem.writeInt(u64, buffer[header_len .. header_len + cancel_payload_len], id, .little);
     std.mem.writeInt(u32, buffer[10..14], std.hash.Crc32.hash(buffer[header_len .. header_len + cancel_payload_len]), .little);
+}
+
+fn encodeSubmitLimitRecord(buffer: []u8, order: engine.Order) void {
+    std.debug.assert(buffer.len == header_len + submit_limit_payload_len);
+    @memcpy(buffer[0..4], magic);
+    buffer[4] = version;
+    buffer[5] = @backingInt(RecordKind.submit_limit);
+    std.mem.writeInt(u32, buffer[6..10], submit_limit_payload_len, .little);
+    buffer[header_len] = switch (order.side) {
+        .buy => 1,
+        .sell => 2,
+    };
+    std.mem.writeInt(u64, buffer[header_len + 1 .. header_len + 9], order.id, .little);
+    std.mem.writeInt(u64, buffer[header_len + 9 .. header_len + 17], order.price, .little);
+    std.mem.writeInt(u64, buffer[header_len + 17 .. header_len + 25], order.quantity, .little);
+    std.mem.writeInt(u32, buffer[10..14], std.hash.Crc32.hash(buffer[header_len..]), .little);
+}
+
+fn expectReaderError(data: []const u8, expected: anyerror) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "record.nmj", .data = data });
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/record.nmj", .{tmp.sub_path[0..]});
+    var reader = try Reader.open(io, path);
+    defer reader.close();
+
+    try std.testing.expectError(expected, reader.next());
 }

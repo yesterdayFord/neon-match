@@ -376,44 +376,42 @@ test "direct command event replay matches stdin fixture output" {
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
 }
 
-test "journal replay matches live output and final book state" {
+test "journal replay matches live input output and final book state" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var journal_dir_buffer: [64]u8 = undefined;
     const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    const events = [_]CommandEvent{
-        buy(1, 100, 10),
-        sell(2, 110, 5),
-        sell(3, 100, 4),
-        buy(4, 110, 8),
-        cancel(2),
-    };
+    const commands =
+        "BUY 1 100 10\n" ++
+        "SELL 2 110 5\n" ++
+        "SELL 3 100 4\n" ++
+        "BUY 4 110 8\n" ++
+        "CANCEL 2\n";
 
     var live_book = engine.OrderBook.init();
     var live_output_buffer: [2048]u8 = undefined;
     var live_writer = std.Io.Writer.fixed(&live_output_buffer);
-    var segment = try journal.Segment.open(io, journal_dir);
-    const journal_path_buffer = segment.path;
-    const journal_path_len = segment.path_len;
-    try live_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
-    for (events) |event| {
-        try applyJournaledCommand(&live_writer, &live_book, &segment, event);
-        try printState(&live_writer, &live_book);
-    }
-    segment.close();
+    var stdin = std.Io.Reader.fixed(commands);
+    try runLive(io, &stdin, &live_writer, &live_book, journal_dir);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)) orelse return error.MissingJournalSegment;
+    try std.testing.expect((try it.next(io)) == null);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try std.fmt.bufPrint(&journal_path_buffer, "{s}/{s}", .{ journal_dir, entry.name });
 
     var replay_book = engine.OrderBook.init();
     var replay_output_buffer: [2048]u8 = undefined;
     var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
-    try replayJournalPath(io, &replay_writer, &replay_book, journal_path_buffer[0..journal_path_len]);
+    try replayJournalPath(io, &replay_writer, &replay_book, journal_path);
 
     try expectOutput(&replay_writer, live_writer.buffered());
     try expectBooksEqual(&live_book, &replay_book);
 }
 
-test "journal append failure prevents command application" {
+test "journal submit append failure prevents command application" {
     const FailingJournal = struct {
         fn appendSubmitLimit(_: *@This(), _: engine.Order) !void {
             return error.JournalWriteFailed;
@@ -435,6 +433,34 @@ test "journal append failure prevents command application" {
     );
 
     try std.testing.expect(!book.containsOrder(1));
+    try expectOutput(&writer, "");
+}
+
+test "journal cancel append failure prevents command application" {
+    const FailingJournal = struct {
+        fn appendSubmitLimit(_: *@This(), _: engine.Order) !void {
+            return error.JournalWriteFailed;
+        }
+
+        fn appendCancel(_: *@This(), _: engine.OrderId) !void {
+            return error.JournalWriteFailed;
+        }
+    };
+
+    var book = engine.OrderBook.init();
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
+    const before = book;
+    writer.end = 0;
+
+    var failing_journal = FailingJournal{};
+    try std.testing.expectError(
+        error.JournalWriteFailed,
+        applyJournaledCommand(&writer, &book, &failing_journal, cancel(1)),
+    );
+
+    try expectBookUnchanged(&before, &book);
     try expectOutput(&writer, "");
 }
 
