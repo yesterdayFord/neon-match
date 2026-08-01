@@ -110,6 +110,7 @@ pub const Reader = struct {
     file: std.Io.File,
     offset: u64 = 0,
     size: u64,
+    recovered_tail: bool = false,
 
     pub fn open(io: std.Io, path: []const u8) !Reader {
         const file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -129,7 +130,10 @@ pub const Reader = struct {
     pub fn next(self: *Reader) !?Record {
         const remaining = self.size - self.offset;
         if (remaining == 0) return null;
-        if (remaining < header_len) return null;
+        if (remaining < header_len) {
+            self.recovered_tail = true;
+            return null;
+        }
 
         var header: [header_len]u8 = undefined;
         try self.readExact(&header);
@@ -150,7 +154,10 @@ pub const Reader = struct {
         };
         if (payload_len != expected_len) return error.InvalidJournalRecordLength;
 
-        if (self.size - self.offset < payload_len) return null;
+        if (self.size - self.offset < payload_len) {
+            self.recovered_tail = true;
+            return null;
+        }
 
         var payload: [submit_limit_payload_len]u8 = undefined;
         const payload_slice = payload[0..payload_len];
@@ -161,6 +168,10 @@ pub const Reader = struct {
             .submit_limit => .{ .submit_limit = try decodeSubmitLimit(payload_slice) },
             .cancel => .{ .cancel = std.mem.readInt(u64, payload_slice[0..8], .little) },
         };
+    }
+
+    pub fn recoveredTail(self: *const Reader) bool {
+        return self.recovered_tail;
     }
 
     fn readExact(self: *Reader, buffer: []u8) !void {

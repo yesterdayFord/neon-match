@@ -12,6 +12,18 @@ const RunMode = union(enum) {
     replay: []const u8,
 };
 
+const max_recovery_segments = 128;
+const max_recovery_output_len = 32768;
+
+const JournalSegmentPath = struct {
+    bytes: [std.Io.Dir.max_path_bytes]u8,
+    len: usize,
+
+    fn slice(self: *const JournalSegmentPath) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var stdin_buffer: [4096]u8 = undefined;
@@ -41,6 +53,7 @@ fn runLive(
     journal_dir: []const u8,
 ) !void {
     var line_buffer: [256]u8 = undefined;
+    try recoverJournalDir(io, book, journal_dir);
     var journal_segment = try journal.Segment.open(io, journal_dir);
     defer journal_segment.close();
 
@@ -62,6 +75,81 @@ fn runLive(
 
         try printState(stdout, book);
         try stdout.flush();
+    }
+}
+
+fn recoverJournalDir(
+    io: std.Io,
+    book: *engine.OrderBook,
+    journal_dir: []const u8,
+) !void {
+    var created_dir = try std.Io.Dir.cwd().createDirPathOpen(io, journal_dir, .{});
+    created_dir.close(io);
+
+    var dir = try std.Io.Dir.cwd().openDir(io, journal_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var segments: [max_recovery_segments]JournalSegmentPath = undefined;
+    var segment_count: usize = 0;
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !isJournalSegmentName(entry.name)) continue;
+        if (segment_count == segments.len) return error.TooManyJournalSegments;
+        const path = try std.fmt.bufPrint(
+            &segments[segment_count].bytes,
+            "{s}/{s}",
+            .{ journal_dir, entry.name },
+        );
+        segments[segment_count].len = path.len;
+        segment_count += 1;
+    }
+
+    sortJournalSegmentPaths(segments[0..segment_count]);
+
+    for (segments[0..segment_count], 0..) |*segment, index| {
+        try recoverJournalPath(io, book, segment.slice(), index + 1 == segment_count);
+    }
+}
+
+fn isJournalSegmentName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "journal-") and std.mem.endsWith(u8, name, ".nmj");
+}
+
+fn sortJournalSegmentPaths(segments: []JournalSegmentPath) void {
+    var index: usize = 1;
+    while (index < segments.len) : (index += 1) {
+        const current = segments[index];
+        var move_index = index;
+        while (move_index > 0 and journalSegmentPathLessThan(current, segments[move_index - 1])) : (move_index -= 1) {
+            segments[move_index] = segments[move_index - 1];
+        }
+        segments[move_index] = current;
+    }
+}
+
+fn journalSegmentPathLessThan(lhs: JournalSegmentPath, rhs: JournalSegmentPath) bool {
+    return std.mem.lessThan(u8, lhs.slice(), rhs.slice());
+}
+
+fn recoverJournalPath(
+    io: std.Io,
+    book: *engine.OrderBook,
+    path: []const u8,
+    is_final_segment: bool,
+) !void {
+    var reader = try journal.Reader.open(io, path);
+    defer reader.close();
+
+    var output_buffer: [max_recovery_output_len]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    while (try reader.next()) |record| {
+        try applyCommandEvent(&writer, book, commandEventFromJournalRecord(record));
+        writer.end = 0;
+    }
+
+    if (reader.recoveredTail() and !is_final_segment) {
+        return error.IncompleteJournalRecordBeforeFinalSegment;
     }
 }
 
@@ -310,6 +398,73 @@ fn fillSideWithRestingOrders(
     }
 }
 
+fn writeJournalSegment(
+    dir: std.Io.Dir,
+    name: []const u8,
+    events: []const CommandEvent,
+) !void {
+    var bytes: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    for (events) |event| try encodeJournalEvent(&writer, event);
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = writer.buffered() });
+}
+
+fn writeJournalSegmentWithTail(
+    dir: std.Io.Dir,
+    name: []const u8,
+    events: []const CommandEvent,
+) !void {
+    var bytes: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    for (events) |event| try encodeJournalEvent(&writer, event);
+    try writer.writeAll("NMJ");
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = writer.buffered() });
+}
+
+fn writeCorruptJournalSegment(
+    dir: std.Io.Dir,
+    name: []const u8,
+    events: []const CommandEvent,
+) !void {
+    var bytes: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    for (events) |event| try encodeJournalEvent(&writer, event);
+    bytes[10] ^= 0xff;
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = writer.buffered() });
+}
+
+fn encodeJournalEvent(writer: *std.Io.Writer, event: CommandEvent) !void {
+    switch (event) {
+        .submit_limit => |order| {
+            var payload: [25]u8 = undefined;
+            payload[0] = switch (order.side) {
+                .buy => 1,
+                .sell => 2,
+            };
+            std.mem.writeInt(u64, payload[1..9], order.id, .little);
+            std.mem.writeInt(u64, payload[9..17], order.price, .little);
+            std.mem.writeInt(u64, payload[17..25], order.quantity, .little);
+            try encodeJournalRecord(writer, 1, &payload);
+        },
+        .cancel => |id| {
+            var payload: [8]u8 = undefined;
+            std.mem.writeInt(u64, &payload, id, .little);
+            try encodeJournalRecord(writer, 2, &payload);
+        },
+    }
+}
+
+fn encodeJournalRecord(writer: *std.Io.Writer, kind: u8, payload: []const u8) !void {
+    var header: [14]u8 = undefined;
+    @memcpy(header[0..4], "NMJ1");
+    header[4] = 1;
+    header[5] = kind;
+    std.mem.writeInt(u32, header[6..10], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, header[10..14], std.hash.Crc32.hash(payload), .little);
+    try writer.writeAll(&header);
+    try writer.writeAll(payload);
+}
+
 test "parse buy sell and cancel commands into command events" {
     const buy_event = try parseCommandEvent("BUY 1 100 10");
     const buy_order = buy_event.submit_limit;
@@ -409,6 +564,150 @@ test "journal replay matches live input output and final book state" {
 
     try expectOutput(&replay_writer, live_writer.buffered());
     try expectBooksEqual(&live_book, &replay_book);
+}
+
+test "live startup recovers existing journal segment before accepting commands" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+
+    var recovered_book = engine.OrderBook.init();
+    var recovered_output_buffer: [1024]u8 = undefined;
+    var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
+    var stdin = std.Io.Reader.fixed("SELL 2 100 4\n");
+    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+
+    var expected_book = engine.OrderBook.init();
+    var expected_output_buffer: [1024]u8 = undefined;
+    var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
+    try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try applyCommandEvent(&expected_writer, &expected_book, buy(1, 100, 10));
+    expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
+    try applyCommandEvent(&expected_writer, &expected_book, sell(2, 100, 4));
+    try printState(&expected_writer, &expected_book);
+
+    try expectOutput(&recovered_writer, expected_writer.buffered());
+    try expectBooksEqual(&expected_book, &recovered_book);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "live startup recovers existing journal segments in lexical segment order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014501Z-000001.nmj",
+        &.{cancel(1)},
+    );
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+
+    var recovered_book = engine.OrderBook.init();
+    var recovered_output_buffer: [1024]u8 = undefined;
+    var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
+    var stdin = std.Io.Reader.fixed("SELL 2 100 1\n");
+    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+
+    var expected_book = engine.OrderBook.init();
+    var expected_output_buffer: [1024]u8 = undefined;
+    var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
+    try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try applyCommandEvent(&expected_writer, &expected_book, buy(1, 100, 10));
+    try applyCommandEvent(&expected_writer, &expected_book, cancel(1));
+    expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
+    try applyCommandEvent(&expected_writer, &expected_book, sell(2, 100, 1));
+    try printState(&expected_writer, &expected_book);
+
+    try expectOutput(&recovered_writer, expected_writer.buffered());
+    try expectBooksEqual(&expected_book, &recovered_book);
+}
+
+test "live startup tolerates incomplete final record only in final segment" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeJournalSegmentWithTail(
+        tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+
+    var recovered_book = engine.OrderBook.init();
+    var recovered_output_buffer: [1024]u8 = undefined;
+    var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
+    var stdin = std.Io.Reader.fixed("SELL 2 100 4\n");
+    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+    try std.testing.expectEqual(@as(usize, 1), recovered_book.bid_count);
+    try std.testing.expectEqual(@as(engine.Quantity, 6), recovered_book.bids[0].quantity);
+
+    var bad_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer bad_tmp.cleanup();
+    var bad_journal_dir_buffer: [64]u8 = undefined;
+    const bad_journal_dir = try std.fmt.bufPrint(&bad_journal_dir_buffer, ".zig-cache/tmp/{s}", .{bad_tmp.sub_path[0..]});
+    try writeJournalSegmentWithTail(
+        bad_tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+    try writeJournalSegment(
+        bad_tmp.dir,
+        "journal-20260730T014501Z-000001.nmj",
+        &.{sell(2, 110, 5)},
+    );
+
+    var bad_book = engine.OrderBook.init();
+    var bad_output_buffer: [1024]u8 = undefined;
+    var bad_writer = std.Io.Writer.fixed(&bad_output_buffer);
+    var bad_stdin = std.Io.Reader.fixed("");
+    try std.testing.expectError(
+        error.IncompleteJournalRecordBeforeFinalSegment,
+        runLive(io, &bad_stdin, &bad_writer, &bad_book, bad_journal_dir),
+    );
+}
+
+test "live startup rejects corruption in existing complete journal record" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeCorruptJournalSegment(
+        tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+
+    var book = engine.OrderBook.init();
+    var output_buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var stdin = std.Io.Reader.fixed("");
+    try std.testing.expectError(
+        error.InvalidJournalChecksum,
+        runLive(io, &stdin, &writer, &book, journal_dir),
+    );
 }
 
 test "journal submit append failure prevents command application" {

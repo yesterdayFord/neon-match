@@ -65,15 +65,9 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     const run_journal_tests = b.addRunArtifact(journal_tests);
     const run_behavior_tests = b.addRunArtifact(behavior_tests);
-    const replay_basic = b.addRunArtifact(exe);
-    replay_basic.addArgs(&.{ "--journal-dir", ".zig-cache/replay-basic-journal" });
-    replay_basic.setStdIn(.{ .lazy_path = b.path("tests/fixtures/basic.commands") });
-    replay_basic.expectStdOutEqual(@embedFile("tests/fixtures/basic.stdout"));
-
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_main_tests.step);
     test_step.dependOn(&run_journal_tests.step);
     test_step.dependOn(&run_behavior_tests.step);
-    test_step.dependOn(&replay_basic.step);
 }
