@@ -243,9 +243,11 @@ Post-MVP scope may include:
 2. Complete: define the core domain vocabulary: side, price, quantity, order id, order, trade, and book state.
 3. Complete: implement a simple reference matcher with focused unit tests.
 4. Complete: add deterministic fixtures and direct `CommandEvent` replay for representative matching and cancellation scenarios.
-5. Post-MVP: add durable journaling as the first new increment.
-6. Post-MVP: measure baseline performance only after behavior is covered by tests.
-7. Post-MVP: introduce optimized structures only when the reference path can validate them.
+5. Complete: add append-only command journaling and deterministic replay from journal records.
+6. Post-MVP: turn journal replay into operational startup recovery, so process-replayable storage becomes the normal startup path rather than only an internal verification path.
+7. Post-MVP: measure the simple single-book engine and verify allocation behavior before expanding its architecture, so future changes have a truthful baseline.
+8. Post-MVP: introduce routing and multiple books for multiple instruments after the recovery path and baseline are established.
+9. Post-MVP: introduce optimized structures only when the reference path and performance baseline can validate them.
 
 ## Non-Goals
 
