@@ -53,6 +53,8 @@ Workloads are `matching`, `resting`, `cancel_heavy`, and `full_capacity`. Each w
 
 Preserved baselines should include the full command, build mode, CPU model, logical CPU, workload, command count, warmup, measurement repetitions, batch size, checksum, and allocation or journal note printed by the harness.
 
+The current preserved baseline is [docs/benchmarks/2026-08-07-baseline.md](docs/benchmarks/2026-08-07-baseline.md).
+
 ## Layout
 
 - `src/main.zig` - stdin command loop
