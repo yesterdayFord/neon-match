@@ -5,6 +5,7 @@ const journal = @import("journal.zig");
 
 const default_command_count: usize = 100_000;
 const default_warmup_count: usize = 10_000;
+const default_latency_sample_size: usize = 64;
 const default_journal_dir = ".zig-cache/bench-journal";
 const missing_cancel_base: engine.OrderId = 1_000_000_000_000;
 
@@ -31,6 +32,7 @@ const Args = struct {
     workload: Workload = .matching,
     command_count: usize = default_command_count,
     warmup_count: usize = default_warmup_count,
+    latency_sample_size: usize = default_latency_sample_size,
     journal_dir: []const u8 = default_journal_dir,
 };
 
@@ -218,6 +220,9 @@ fn parseArgs(args: *std.process.Args.Iterator) !Args {
             if (parsed.command_count == 0) return error.CommandCountMustBePositive;
         } else if (std.mem.eql(u8, arg, "--warmup")) {
             parsed.warmup_count = try std.fmt.parseInt(usize, args.next() orelse return error.MissingWarmupCount, 10);
+        } else if (std.mem.eql(u8, arg, "--latency-sample-size")) {
+            parsed.latency_sample_size = try std.fmt.parseInt(usize, args.next() orelse return error.MissingLatencySampleSize, 10);
+            if (parsed.latency_sample_size == 0) return error.LatencySampleSizeMustBePositive;
         } else if (std.mem.eql(u8, arg, "--journal-dir")) {
             parsed.journal_dir = args.next() orelse return error.MissingJournalDir;
         } else {
@@ -240,6 +245,7 @@ fn validateArgs(args: Args) !void {
     const max_commands = @as(usize, std.math.maxInt(u32));
     if (args.command_count > max_commands) return error.CommandCountTooLarge;
     if (args.warmup_count > max_commands) return error.WarmupCountTooLarge;
+    if (args.latency_sample_size > max_commands) return error.LatencySampleSizeTooLarge;
 }
 
 fn runWarmup(io: std.Io, args: Args) !void {
@@ -281,6 +287,7 @@ fn runCommandLoop(io: std.Io, args: Args, comptime record_latency: bool) !Benchm
     const benchmark_end = timestampNs(io);
 
     result.elapsed_ns = elapsedNs(benchmark_start, benchmark_end);
+    if (result.elapsed_ns == 0) return error.BenchmarkTimestampResolutionTooCoarse;
     result.final_live_orders = book.bid_count + book.ask_count;
     result.checksum = checksumBook(&book) ^ @as(u64, @intCast(result.counters.trades));
     std.mem.doNotOptimizeAway(result.checksum);
@@ -313,15 +320,23 @@ fn runLatencyLoop(
     result: *BenchmarkResult,
 ) !void {
     var index: usize = 0;
-    while (index < args.command_count) : (index += 1) {
-        const command = workload_state.next(args.workload);
+    while (index < args.command_count) {
+        const sample_count = @min(args.latency_sample_size, args.command_count - index);
         const command_start = timestampNs(io);
-        if (segment.*) |*open_segment| {
-            try appendJournalCommand(open_segment, command);
+        var sample_index: usize = 0;
+        while (sample_index < sample_count) : (sample_index += 1) {
+            const command = workload_state.next(args.workload);
+            if (segment.*) |*open_segment| {
+                try appendJournalCommand(open_segment, command);
+            }
+            applyCommand(book, command, &result.counters);
         }
-        applyCommand(book, command, &result.counters);
         const command_end = timestampNs(io);
-        result.histogram.observe(elapsedNs(command_start, command_end));
+        const sample_elapsed = elapsedNs(command_start, command_end);
+        if (sample_elapsed == 0) return error.BenchmarkTimestampResolutionTooCoarse;
+        const per_command_ns = (sample_elapsed + sample_count - 1) / sample_count;
+        result.histogram.observe(per_command_ns);
+        index += sample_count;
     }
 }
 
@@ -440,6 +455,9 @@ fn printResult(writer: *std.Io.Writer, args: Args, result: BenchmarkResult) !voi
     try writer.print("workload: {s}\n", .{@tagName(args.workload)});
     try writer.print("commands: {d}\n", .{args.command_count});
     try writer.print("warmup_commands: {d}\n", .{args.warmup_count});
+    if (args.measurement == .latency) {
+        try writer.print("latency_sample_size: {d}\n", .{args.latency_sample_size});
+    }
     try writer.print("command: zig build bench -Doptimize={s} -- --measurement {s} --mode {s} --workload {s} --commands {d} --warmup {d}", .{
         optimizeCliName(),
         @tagName(args.measurement),
@@ -448,6 +466,9 @@ fn printResult(writer: *std.Io.Writer, args: Args, result: BenchmarkResult) !voi
         args.command_count,
         args.warmup_count,
     });
+    if (args.measurement == .latency) {
+        try writer.print(" --latency-sample-size {d}", .{args.latency_sample_size});
+    }
     if (args.mode == .journal) {
         try writer.print(" --journal-dir {s}", .{args.journal_dir});
     }
@@ -467,6 +488,7 @@ fn printResult(writer: *std.Io.Writer, args: Args, result: BenchmarkResult) !voi
         try writer.writeAll("service_time_percentiles: not_collected_in_throughput_measurement\n");
     } else {
         try writer.writeAll("throughput_commands_per_second: not_collected\n");
+        try writer.print("service_time_samples: {d}\n", .{result.histogram.count});
         try writer.print("service_time_ns_min: {d}\n", .{if (result.histogram.count == 0) 0 else result.histogram.min_ns});
         try writer.print("service_time_ns_avg: {d}\n", .{result.histogram.averageNs()});
         try writer.print("service_time_ns_p50_upper_bound: {d}\n", .{result.histogram.percentileUpperBoundNs(50)});
@@ -490,7 +512,7 @@ fn printResult(writer: *std.Io.Writer, args: Args, result: BenchmarkResult) !voi
         .matcher => try writer.writeAll("allocation_note: matcher mode uses fixed OrderBook storage and no allocator in warm-up or measurement command loops\n"),
         .journal => try writer.writeAll("journal_note: journal mode measures serialization, checksum work, and buffered writes accepted by the OS page cache; it does not measure stable-storage durability because there is no per-command fsync or fdatasync\n"),
     }
-    try writer.writeAll("coordinated_omission_note: latency mode reports isolated command service time and excludes ingress queueing; do not interpret these percentiles as end-to-end system latency under offered load\n");
+    try writer.writeAll("coordinated_omission_note: latency mode reports isolated command service-time estimates from fixed-size batches and excludes ingress queueing; do not interpret these percentiles as end-to-end system latency under offered load\n");
 }
 
 fn submit(id: engine.OrderId, side: engine.Side, price: engine.Price, quantity: engine.Quantity) Command {

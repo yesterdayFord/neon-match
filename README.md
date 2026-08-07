@@ -40,11 +40,11 @@ zig build test
 
 ```sh
 zig build bench -Doptimize=ReleaseFast -- --measurement throughput --mode matcher --workload matching --commands 1000000 --warmup 10000
-zig build bench -Doptimize=ReleaseFast -- --measurement latency --mode matcher --workload matching --commands 100000 --warmup 10000
+zig build bench -Doptimize=ReleaseFast -- --measurement latency --mode matcher --workload matching --commands 100000 --warmup 10000 --latency-sample-size 64
 zig build bench -Doptimize=ReleaseFast -- --measurement throughput --mode journal --workload matching --commands 1000000 --warmup 10000 --journal-dir .zig-cache/bench-journal
 ```
 
-Measurements are intentionally separate. `throughput` uses one batch timer around the command loop and does not collect per-command service-time percentiles. `latency` measures isolated command service time and excludes ingress queueing, so its percentiles are not end-to-end system latency under offered load.
+Measurements are intentionally separate. `throughput` uses one batch timer around the command loop and does not collect per-command service-time percentiles. `latency` times fixed-size batches and reports per-command service-time estimates from those batches; it excludes ingress queueing, so its percentiles are not end-to-end system latency under offered load. If a latency batch is too short for the platform timer resolution, the harness fails instead of reporting a zero-duration sample.
 
 Workloads are `matching`, `resting`, `cancel_heavy`, and `full_capacity`. Each workload declares bounded live-order count, price range, id range, expected operation counters, and checksum output. Journal mode measures record serialization, checksum work, and buffered writes accepted by the OS page cache; it does not measure stable-storage persistence because NeonMatch does not issue per-command `fsync` or `fdatasync`.
 
