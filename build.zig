@@ -20,6 +20,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run neon-match");
     run_step.dependOn(&run.step);
 
+    const bench = b.addExecutable(.{
+        .name = "neon-match-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+
+    const bench_step = b.step("bench", "Run deterministic benchmark workloads");
+    bench_step.dependOn(&run_bench.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/engine.zig"),

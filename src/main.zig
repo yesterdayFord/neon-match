@@ -18,6 +18,7 @@ const max_recovery_output_len = 32768;
 const JournalSegmentPath = struct {
     bytes: [std.Io.Dir.max_path_bytes]u8,
     len: usize,
+    number: u32,
 
     fn slice(self: *const JournalSegmentPath) []const u8 {
         return self.bytes[0..self.len];
@@ -94,26 +95,25 @@ fn recoverJournalDir(
 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file or !isJournalSegmentName(entry.name)) continue;
-        if (segment_count == segments.len) return error.TooManyJournalSegments;
+        if (entry.kind != .file) continue;
+        const segment_number = journal.segmentNumberFromName(entry.name) orelse continue;
+        if (segment_count == segments.len) return error.RecoverySegmentLimitExceeded;
         const path = try std.fmt.bufPrint(
             &segments[segment_count].bytes,
             "{s}/{s}",
             .{ journal_dir, entry.name },
         );
         segments[segment_count].len = path.len;
+        segments[segment_count].number = segment_number;
         segment_count += 1;
     }
 
     sortJournalSegmentPaths(segments[0..segment_count]);
+    try validateUniqueSegmentNumbers(segments[0..segment_count]);
 
     for (segments[0..segment_count], 0..) |*segment, index| {
         try recoverJournalPath(io, book, segment.slice(), index + 1 == segment_count);
     }
-}
-
-fn isJournalSegmentName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "journal-") and std.mem.endsWith(u8, name, ".nmj");
 }
 
 fn sortJournalSegmentPaths(segments: []JournalSegmentPath) void {
@@ -129,7 +129,18 @@ fn sortJournalSegmentPaths(segments: []JournalSegmentPath) void {
 }
 
 fn journalSegmentPathLessThan(lhs: JournalSegmentPath, rhs: JournalSegmentPath) bool {
-    return std.mem.lessThan(u8, lhs.slice(), rhs.slice());
+    return lhs.number < rhs.number;
+}
+
+fn validateUniqueSegmentNumbers(segments: []const JournalSegmentPath) !void {
+    if (segments.len == 0) return;
+
+    var index: usize = 1;
+    while (index < segments.len) : (index += 1) {
+        if (segments[index - 1].number == segments[index].number) {
+            return error.DuplicateJournalSegmentNumber;
+        }
+    }
 }
 
 fn recoverJournalPath(
@@ -409,6 +420,16 @@ fn writeJournalSegment(
     try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = writer.buffered() });
 }
 
+fn writeEmptyJournalSegmentNumber(dir: std.Io.Dir, number: u32) !void {
+    var name_buffer: [40]u8 = undefined;
+    const name = try std.fmt.bufPrint(
+        &name_buffer,
+        "journal-20260730T014500Z-{d:0>6}.nmj",
+        .{number},
+    );
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "" });
+}
+
 fn writeJournalSegmentWithTail(
     dir: std.Io.Dir,
     name: []const u8,
@@ -603,7 +624,7 @@ test "live startup recovers existing journal segment before accepting commands" 
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "live startup recovers existing journal segments in lexical segment order" {
+test "live startup recovers existing journal segments in segment number order when timestamps move backward" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -613,12 +634,12 @@ test "live startup recovers existing journal segments in lexical segment order" 
     try writeJournalSegment(
         tmp.dir,
         "journal-20260730T014501Z-000001.nmj",
-        &.{cancel(1)},
+        &.{buy(1, 100, 10)},
     );
     try writeJournalSegment(
         tmp.dir,
-        "journal-20260730T014500Z-000001.nmj",
-        &.{buy(1, 100, 10)},
+        "journal-20260730T014500Z-000002.nmj",
+        &.{cancel(1)},
     );
 
     var recovered_book = engine.OrderBook.init();
@@ -639,6 +660,92 @@ test "live startup recovers existing journal segments in lexical segment order" 
 
     try expectOutput(&recovered_writer, expected_writer.buffered());
     try expectBooksEqual(&expected_book, &recovered_book);
+}
+
+test "live startup creates the next segment number after recovery without reusing a gap" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014501Z-000001.nmj",
+        &.{buy(1, 100, 10)},
+    );
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014500Z-000003.nmj",
+        &.{cancel(1)},
+    );
+
+    var recovered_book = engine.OrderBook.init();
+    var output_buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var stdin = std.Io.Reader.fixed("");
+    try runLive(io, &stdin, &writer, &recovered_book, journal_dir);
+
+    var found_1 = false;
+    var found_2 = false;
+    var found_3 = false;
+    var found_4 = false;
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |entry| {
+        const segment_number = journal.segmentNumberFromName(entry.name) orelse continue;
+        count += 1;
+        switch (segment_number) {
+            1 => found_1 = true,
+            2 => found_2 = true,
+            3 => found_3 = true,
+            4 => found_4 = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expect(found_1);
+    try std.testing.expect(!found_2);
+    try std.testing.expect(found_3);
+    try std.testing.expect(found_4);
+}
+
+test "live startup enforces the fixed recovery segment limit boundary" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var number: u32 = 1;
+    while (number <= max_recovery_segments) : (number += 1) {
+        try writeEmptyJournalSegmentNumber(tmp.dir, number);
+    }
+
+    var book = engine.OrderBook.init();
+    var output_buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var stdin = std.Io.Reader.fixed("");
+    try runLive(io, &stdin, &writer, &book, journal_dir);
+
+    var bad_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer bad_tmp.cleanup();
+    var bad_journal_dir_buffer: [64]u8 = undefined;
+    const bad_journal_dir = try std.fmt.bufPrint(&bad_journal_dir_buffer, ".zig-cache/tmp/{s}", .{bad_tmp.sub_path[0..]});
+    number = 1;
+    while (number <= max_recovery_segments + 1) : (number += 1) {
+        try writeEmptyJournalSegmentNumber(bad_tmp.dir, number);
+    }
+
+    var bad_book = engine.OrderBook.init();
+    var bad_output_buffer: [1024]u8 = undefined;
+    var bad_writer = std.Io.Writer.fixed(&bad_output_buffer);
+    var bad_stdin = std.Io.Reader.fixed("");
+    try std.testing.expectError(
+        error.RecoverySegmentLimitExceeded,
+        runLive(io, &bad_stdin, &bad_writer, &bad_book, bad_journal_dir),
+    );
 }
 
 test "live startup tolerates incomplete final record only in final segment" {
@@ -673,7 +780,7 @@ test "live startup tolerates incomplete final record only in final segment" {
     );
     try writeJournalSegment(
         bad_tmp.dir,
-        "journal-20260730T014501Z-000001.nmj",
+        "journal-20260730T014501Z-000002.nmj",
         &.{sell(2, 110, 5)},
     );
 

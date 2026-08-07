@@ -8,6 +8,7 @@ const submit_limit_payload_len = 25;
 const cancel_payload_len = 8;
 
 pub const default_dir = "journal";
+pub const max_segment_number: u32 = 999999;
 
 pub const RecordKind = enum(u8) {
     submit_limit = 1,
@@ -28,19 +29,22 @@ pub const Segment = struct {
     const max_segment_path_len = std.Io.Dir.max_path_bytes;
 
     pub fn open(io: std.Io, journal_dir: []const u8) !Segment {
-        var dir = try std.Io.Dir.cwd().createDirPathOpen(io, journal_dir, .{});
+        var created_dir = try std.Io.Dir.cwd().createDirPathOpen(io, journal_dir, .{});
+        created_dir.close(io);
+
+        var dir = try std.Io.Dir.cwd().openDir(io, journal_dir, .{ .iterate = true });
         defer dir.close(io);
 
         var timestamp_buffer: [16]u8 = undefined;
         const timestamp = formatUtcTimestamp(&timestamp_buffer, std.Io.Timestamp.now(io, .real));
 
         var filename_buffer: [40]u8 = undefined;
-        var sequence: u32 = 1;
-        while (sequence <= 999999) : (sequence += 1) {
+        var segment_number = try nextSegmentNumber(io, &dir);
+        while (segment_number <= max_segment_number) : (segment_number += 1) {
             const filename = try std.fmt.bufPrint(
                 &filename_buffer,
                 "journal-{s}-{d:0>6}.nmj",
-                .{ timestamp, sequence },
+                .{ timestamp, segment_number },
             );
             const file = dir.createFile(io, filename, .{
                 .truncate = false,
@@ -104,6 +108,39 @@ pub const Segment = struct {
         try self.file.writeStreamingAll(self.io, payload);
     }
 };
+
+pub fn segmentNumberFromName(name: []const u8) ?u32 {
+    const prefix = "journal-";
+    const suffix = ".nmj";
+    const number_len = 6;
+
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    if (name.len < prefix.len + 1 + number_len + suffix.len) return null;
+
+    const number_start = name.len - suffix.len - number_len;
+    if (name[number_start - 1] != '-') return null;
+    const number_text = name[number_start .. number_start + number_len];
+    for (number_text) |byte| {
+        if (byte < '0' or byte > '9') return null;
+    }
+
+    const number = std.fmt.parseInt(u32, number_text, 10) catch return null;
+    if (number == 0 or number > max_segment_number) return null;
+    return number;
+}
+
+fn nextSegmentNumber(io: std.Io, dir: *std.Io.Dir) !u32 {
+    var max_number: u32 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const number = segmentNumberFromName(entry.name) orelse continue;
+        max_number = @max(max_number, number);
+    }
+    if (max_number == max_segment_number) return error.JournalSegmentSequenceExhausted;
+    return max_number + 1;
+}
 
 pub const Reader = struct {
     io: std.Io,

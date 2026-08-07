@@ -19,11 +19,11 @@ NeonMatch is a small, explicit, deterministic matching-engine project. Its purpo
 - Benchmarks should describe performance observations, not replace correctness tests.
 - Project documentation should have one canonical home for each kind of knowledge.
 
-## MVP Status
+## Status
 
-The MVP is complete once `CommandEvent` is merged into `main`: the project has a deterministic fixed-capacity matching engine, stdin command handling, a direct command-event boundary, fixture-backed replay coverage, and focused tests for order acceptance, cancellation, matching, and capacity edges.
+The original MVP is historical and complete: the project has a deterministic fixed-capacity matching engine, stdin command handling, a direct command-event boundary, fixture-backed replay coverage, and focused tests for order acceptance, cancellation, matching, and capacity edges.
 
-The first post-MVP increment is durable journaling. Treat event logs, replay beyond the current deterministic fixtures, and audit-oriented storage as post-MVP work.
+Completed post-MVP increments include process-replayable command journaling and operational startup recovery. Treat broader event logs, audit-oriented storage, snapshots, retention, and performance work as later post-MVP work.
 
 ## Journaling Guidance
 
@@ -33,7 +33,7 @@ The command journal is authoritative. Trades, errors, and book state are determi
 
 Live and replay differ only in where the next `CommandEvent` comes from.
 
-NeonMatch stores journals in a configurable runtime directory as append-only `.nmj` segments. Each engine start creates a new UTC-named segment. Segment and record order, not timestamps, define command order. Closed segments are immutable and replayed in sequence.
+NeonMatch stores process-replayable journals in a configurable runtime directory as append-only `.nmj` segments. Each engine start creates a fresh segment with a persistent monotonically increasing segment number. Segment number and record order, not timestamps, define command order. Closed segments are immutable and replayed in segment-number order.
 
 General rules:
 
@@ -46,12 +46,12 @@ General rules:
 - A journal write failure must prevent the corresponding command from executing.
 - Verify replay by comparing observable output and final book state with the original execution.
 
-Admission and durability:
+Admission and persistence:
 
 - The live admission path is `parse -> append -> apply`.
 - A command must be completely appended to the OS-managed journal before it is applied to the engine.
 - Per-command stable-storage sync is not required before applying a command.
-- Stable-storage durability is committed at controlled boundaries and during graceful shutdown.
+- Stable-storage persistence is committed at controlled boundaries and during graceful shutdown.
 - Do not put a disk barrier such as per-command `fsync` on the default command path.
 - The initial guarantee is process-replayable journaling, not zero-loss recovery from sudden machine or power failure.
 - If stronger crash recovery becomes a real requirement, use batching or group commit rather than per-command sync.
@@ -64,10 +64,10 @@ Runtime layout and naming:
 - Keep journal files out of `src/`; the implementation belongs in `src/journal.zig`.
 - Add `journal/` to `.gitignore`.
 - Tests must use a temporary directory, never the real journal directory.
-- Name segments `journal-<UTC-start-time>-<sequence>.nmj`, for example `journal-20260730T014500Z-000001.nmj`.
+- Name segments `journal-<UTC-start-time>-<segment-number>.nmj`, for example `journal-20260730T014500Z-000001.nmj`.
 - Use UTC only in filenames.
-- The timestamp records when the segment was created.
-- Use a zero-padded sequence to prevent collisions and preserve lexical order.
+- The timestamp records when the segment was created and is descriptive metadata only.
+- Use a zero-padded segment number to prevent collisions and preserve the authoritative segment order.
 - Do not put mutable information, such as ending time or record count, in the filename.
 
 Segment lifecycle:
@@ -78,8 +78,8 @@ Segment lifecycle:
 - Append records only.
 - Never reopen an old segment for appending.
 - Never overwrite an existing filename.
-- On collision, advance the sequence or fail safely.
-- Replay segments in timestamp-and-sequence order.
+- On collision, advance the segment number or fail safely.
+- Replay segments in ascending segment-number order.
 - Add size-based rollover later, probably with a simple bound such as 256 MiB.
 - Do not use midnight as the primary rollover boundary.
 
@@ -88,7 +88,7 @@ Date and ordering rules:
 - Store timestamps in UTC.
 - Do not encode local timezone, DST, or trading date into the core journal format.
 - If a business or trading date becomes useful later, derive or index it separately.
-- Ordering must come from record order and segment sequence, not wall-clock timestamps.
+- Ordering must come from record order and segment number, not wall-clock timestamps.
 
 Recovery and retention:
 
@@ -96,6 +96,7 @@ Recovery and retention:
 - A closed segment is immutable.
 - An incomplete final record after a crash is ignored or safely truncated during recovery.
 - Corruption before the final record is an error, not something replay silently skips.
+- Startup recovery uses fixed storage for discovered segment paths and currently accepts at most 128 existing journal segments. Exceeding that bound is a clear startup failure, `RecoverySegmentLimitExceeded`, until rollover, snapshots, or retention become real requirements.
 - Retention, archival, deletion, and compression remain outside the matching engine initially.
 
 The first journaling increment should include only:
@@ -228,9 +229,13 @@ Initial scope includes:
 - Deterministic fixtures for order book transitions.
 - A concise operational README and project-local agent guidance.
 
-Post-MVP scope may include:
+Completed post-MVP scope includes:
 
-- Durable journaling as the first post-MVP increment.
+- Process-replayable command journaling.
+- Operational startup recovery from journal segments.
+
+Future post-MVP scope may include:
+
 - Market orders or additional order types.
 - Performance benchmarks.
 - Alternative optimized data structures.
@@ -243,7 +248,7 @@ Post-MVP scope may include:
 2. Complete: define the core domain vocabulary: side, price, quantity, order id, order, trade, and book state.
 3. Complete: implement a simple reference matcher with focused unit tests.
 4. Complete: add deterministic fixtures and direct `CommandEvent` replay for representative matching and cancellation scenarios.
-5. Complete: add append-only command journaling and deterministic replay from journal records.
+5. Complete: add append-only process-replayable command journaling and deterministic replay from journal records.
 6. Complete: turn journal replay into operational startup recovery, so process-replayable storage is the normal startup path before live commands are accepted.
 7. Post-MVP: measure the simple single-book engine and verify allocation behavior before expanding its architecture, so future changes have a truthful baseline.
 8. Post-MVP: introduce routing and multiple books for multiple instruments after the recovery path and baseline are established.
