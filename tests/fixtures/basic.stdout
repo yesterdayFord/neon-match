@@ -1,26 +1,31 @@
-commands: BUY id price quantity | SELL id price quantity | CANCEL id
+commands: [INSTRUMENT id] BUY id price quantity | [INSTRUMENT id] SELL id price quantity | [INSTRUMENT id] CANCEL id
+INSTRUMENT 1
 BOOK
   BIDS
     id=1 price=100 quantity=10
   ASKS
+INSTRUMENT 1
 BOOK
   BIDS
     id=1 price=100 quantity=10
   ASKS
     id=2 price=110 quantity=5
-TRADE maker=1 taker=3 price=100 quantity=4
+INSTRUMENT 1 TRADE maker=1 taker=3 price=100 quantity=4
+INSTRUMENT 1
 BOOK
   BIDS
     id=1 price=100 quantity=6
   ASKS
     id=2 price=110 quantity=5
-TRADE maker=2 taker=4 price=110 quantity=5
+INSTRUMENT 1 TRADE maker=2 taker=4 price=110 quantity=5
+INSTRUMENT 1
 BOOK
   BIDS
     id=4 price=110 quantity=3
     id=1 price=100 quantity=6
   ASKS
-NOT_FOUND 2
+INSTRUMENT 1 NOT_FOUND 2
+INSTRUMENT 1
 BOOK
   BIDS
     id=4 price=110 quantity=3

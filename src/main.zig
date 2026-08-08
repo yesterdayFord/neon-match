@@ -49,6 +49,7 @@ const RunMode = union(enum) {
 
 const max_recovery_segments = 128;
 const max_recovery_output_len = 32768;
+const command_help = "commands: [INSTRUMENT id] BUY id price quantity | [INSTRUMENT id] SELL id price quantity | [INSTRUMENT id] CANCEL id\n";
 
 const JournalSegmentPath = struct {
     bytes: [std.Io.Dir.max_path_bytes]u8,
@@ -93,7 +94,7 @@ fn runLive(
     var journal_segment = try journal.Segment.open(io, journal_dir);
     defer journal_segment.close();
 
-    try stdout.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try stdout.writeAll(command_help);
     try stdout.flush();
 
     while (try readLine(stdin, &line_buffer)) |line| {
@@ -109,7 +110,7 @@ fn runLive(
 
         try applyJournaledCommand(stdout, books, &journal_segment, event);
 
-        try printState(stdout, books);
+        try printInstrumentState(stdout, books, commandEventInstrumentId(event));
         try stdout.flush();
     }
 }
@@ -259,10 +260,11 @@ pub fn replayJournal(
     books: *BookSet,
     reader: *journal.Reader,
 ) !void {
-    try writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try writer.writeAll(command_help);
     while (try reader.next()) |record| {
-        try applyCommandEvent(writer, books, commandEventFromJournalRecord(record));
-        try printState(writer, books);
+        const event = commandEventFromJournalRecord(record);
+        try applyCommandEvent(writer, books, event);
+        try printInstrumentState(writer, books, commandEventInstrumentId(event));
     }
 }
 
@@ -279,6 +281,13 @@ fn commandEventFromJournalRecord(record: journal.Record) CommandEvent {
     };
 }
 
+fn commandEventInstrumentId(event: CommandEvent) InstrumentId {
+    return switch (event) {
+        .submit_limit => |instrumented| instrumented.instrument_id,
+        .cancel => |instrumented| instrumented.instrument_id,
+    };
+}
+
 pub fn applyCommandEvent(
     writer: *std.Io.Writer,
     books: *BookSet,
@@ -288,17 +297,17 @@ pub fn applyCommandEvent(
         .submit_limit => |instrumented| {
             const book = try books.bookFor(instrumented.instrument_id);
             const order = instrumented.order;
-            if (!try canAccept(writer, book, order)) return;
+            if (!try canAccept(writer, instrumented.instrument_id, book, order)) return;
             const result = book.submitLimit(order);
-            try printTrades(writer, &result);
+            try printTrades(writer, instrumented.instrument_id, &result);
         },
         .cancel => |instrumented| {
             const book = try books.bookFor(instrumented.instrument_id);
             const id = instrumented.order_id;
             if (book.cancel(id)) {
-                try writer.print("CANCELED {d}\n", .{id});
+                try writer.print("INSTRUMENT {d} CANCELED {d}\n", .{ instrumented.instrument_id, id });
             } else {
-                try writer.print("NOT_FOUND {d}\n", .{id});
+                try writer.print("INSTRUMENT {d} NOT_FOUND {d}\n", .{ instrumented.instrument_id, id });
             }
         },
     }
@@ -306,15 +315,16 @@ pub fn applyCommandEvent(
 
 fn canAccept(
     writer: *std.Io.Writer,
+    instrument_id: InstrumentId,
     book: *const engine.OrderBook,
     order: engine.Order,
 ) !bool {
     if (book.containsOrder(order.id)) {
-        try writer.print("ERROR DuplicateOrderId {d}\n", .{order.id});
+        try writer.print("INSTRUMENT {d} ERROR DuplicateOrderId {d}\n", .{ instrument_id, order.id });
         return false;
     }
     if (book.restingQuantityAfterMatch(order) > 0 and !book.hasRoomFor(order.side)) {
-        try writer.writeAll("ERROR BookFull\n");
+        try writer.print("INSTRUMENT {d} ERROR BookFull\n", .{instrument_id});
         return false;
     }
     return true;
@@ -406,13 +416,13 @@ fn parsePositive(comptime T: type, text: []const u8) !T {
     return value;
 }
 
-fn printTrades(writer: *std.Io.Writer, result: *const engine.MatchResult) !void {
+fn printTrades(writer: *std.Io.Writer, instrument_id: InstrumentId, result: *const engine.MatchResult) !void {
     var index: usize = 0;
     while (index < result.trade_count) : (index += 1) {
         const trade = result.trades[index];
         try writer.print(
-            "TRADE maker={d} taker={d} price={d} quantity={d}\n",
-            .{ trade.maker_id, trade.taker_id, trade.price, trade.quantity },
+            "INSTRUMENT {d} TRADE maker={d} taker={d} price={d} quantity={d}\n",
+            .{ instrument_id, trade.maker_id, trade.taker_id, trade.price, trade.quantity },
         );
     }
 }
@@ -444,6 +454,12 @@ fn printState(writer: *std.Io.Writer, books: *const BookSet) !void {
         try writer.print("INSTRUMENT {d}\n", .{index + 1});
         try printSingleBookState(writer, book);
     }
+}
+
+fn printInstrumentState(writer: *std.Io.Writer, books: *const BookSet, instrument_id: InstrumentId) !void {
+    const index = try instrumentIndex(instrument_id);
+    try writer.print("INSTRUMENT {d}\n", .{instrument_id});
+    try printSingleBookState(writer, &books.books[index]);
 }
 
 fn printSingleBookState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
@@ -700,7 +716,7 @@ test "buy sell and cancel events can be applied without stdin" {
 
     try std.testing.expect(!book.containsOrder(1));
     try std.testing.expect(book.containsOrder(2));
-    try expectOutput(&writer, "CANCELED 1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 CANCELED 1\n");
 }
 
 test "direct command event replay matches stdin fixture output" {
@@ -708,7 +724,7 @@ test "direct command event replay matches stdin fixture output" {
     var output_buffer: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try writer.writeAll(command_help);
 
     const events = [_]CommandEvent{
         buy(1, 100, 10),
@@ -721,7 +737,7 @@ test "direct command event replay matches stdin fixture output" {
         try applySingleBookCommandEvent(&writer, &book, event);
         var books = BookSet.init();
         books.books[instrumentIndex(default_instrument_id) catch unreachable] = book;
-        try printState(&writer, &books);
+        try printInstrumentState(&writer, &books, commandEventInstrumentId(event));
     }
 
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -755,7 +771,7 @@ test "routed commands only match within the targeted instrument" {
     try std.testing.expectEqual(@as(engine.OrderId, 1), book_2.bids[0].id);
 
     try applyCommandEvent(&writer, &books, instrumentBuy(1, 2, 100, 5));
-    try expectOutput(&writer, "TRADE maker=1 taker=2 price=100 quantity=5\n");
+    try expectOutput(&writer, "INSTRUMENT 1 TRADE maker=1 taker=2 price=100 quantity=5\n");
     try std.testing.expectEqual(@as(usize, 0), book_1.ask_count);
     try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
 }
@@ -774,7 +790,7 @@ test "cancel only affects the targeted instrument" {
     try std.testing.expectEqual(@as(usize, 0), book_1.bid_count);
     try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
     try std.testing.expectEqual(@as(engine.OrderId, 1), book_2.bids[0].id);
-    try expectOutput(&writer, "CANCELED 1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 CANCELED 1\n");
 }
 
 test "journal replay matches live input output and final book state" {
@@ -870,7 +886,7 @@ test "invalid routed instruments are not journaled and do not mutate books" {
     try expectBooksEqual(&before, &books);
     try expectOutput(
         &writer,
-        "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n" ++
+        command_help ++
             "ERROR UnknownInstrument\n" ++
             "BOOK\n" ++
             "  BIDS\n" ++
@@ -922,47 +938,40 @@ test "routed duplicate id rejection is journaled without mutating any book" {
 }
 
 test "routed book full rejection is journaled and isolated to the targeted book" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
+    const CountingJournal = struct {
+        append_count: usize = 0,
 
-    var journal_dir_buffer: [64]u8 = undefined;
-    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+        fn appendSubmitLimit(self: *@This(), instrument_id: InstrumentId, order: engine.Order) !void {
+            try std.testing.expectEqual(@as(InstrumentId, 2), instrument_id);
+            try std.testing.expectEqual(@as(engine.OrderId, 200), order.id);
+            self.append_count += 1;
+        }
 
-    var commands_buffer: [8192]u8 = undefined;
-    var commands_writer = std.Io.Writer.fixed(&commands_buffer);
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            return error.UnexpectedCancelAppend;
+        }
+    };
+
+    var books = BookSet.init();
+    var discard_buffer: [64]u8 = undefined;
+    var discard_writer = std.Io.Writer.fixed(&discard_buffer);
     var id: engine.OrderId = 1;
     while (id <= engine.max_orders) : (id += 1) {
-        try commands_writer.print("INSTRUMENT 2 BUY {d} 90 1\n", .{id});
+        discard_writer.end = 0;
+        try applyCommandEvent(&discard_writer, &books, instrumentBuy(2, id, 90, 1));
     }
-    try commands_writer.writeAll("INSTRUMENT 1 BUY 1 90 1\n");
-    try commands_writer.writeAll("INSTRUMENT 2 BUY 200 89 1\n");
+    discard_writer.end = 0;
+    try applyCommandEvent(&discard_writer, &books, instrumentBuy(1, 1, 90, 1));
+    const before = books;
 
-    var live_books = BookSet.init();
-    var live_output_buffer: [262144]u8 = undefined;
-    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
-    var stdin = std.Io.Reader.fixed(commands_writer.buffered());
-    try runLive(io, &stdin, &live_writer, &live_books, journal_dir);
+    var journal_segment = CountingJournal{};
+    var output_buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    try applyJournaledCommand(&writer, &books, &journal_segment, instrumentBuy(2, 200, 89, 1));
 
-    const book_1 = try live_books.bookFor(1);
-    const book_2 = try live_books.bookFor(2);
-    try std.testing.expectEqual(@as(usize, 1), book_1.bid_count);
-    try std.testing.expectEqual(@as(engine.OrderId, 1), book_1.bids[0].id);
-    try std.testing.expectEqual(@as(usize, engine.max_orders), book_2.bid_count);
-    try std.testing.expect(!book_2.containsOrder(200));
-    try std.testing.expect(std.mem.indexOf(u8, live_writer.buffered(), "ERROR BookFull\n") != null);
-
-    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
-    try std.testing.expectEqual(@as(usize, engine.max_orders + 2), try journalRecordCount(io, journal_path));
-
-    var replay_books = BookSet.init();
-    var replay_output_buffer: [262144]u8 = undefined;
-    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
-    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
-
-    try expectOutput(&replay_writer, live_writer.buffered());
-    try expectBooksEqual(&live_books, &replay_books);
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(&writer, "INSTRUMENT 2 ERROR BookFull\n");
 }
 
 test "startup recovery preserves routed journal state" {
@@ -1014,11 +1023,11 @@ test "live startup recovers existing journal segment before accepting commands" 
     var expected_books = BookSet.init();
     var expected_output_buffer: [1024]u8 = undefined;
     var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
-    try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try expected_writer.writeAll(command_help);
     try applyCommandEvent(&expected_writer, &expected_books, buy(1, 100, 10));
-    expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
+    expected_writer.end = command_help.len;
     try applyCommandEvent(&expected_writer, &expected_books, sell(2, 100, 4));
-    try printState(&expected_writer, &expected_books);
+    try printInstrumentState(&expected_writer, &expected_books, default_instrument_id);
 
     try expectOutput(&recovered_writer, expected_writer.buffered());
     try expectBooksEqual(&expected_books, &recovered_books);
@@ -1056,12 +1065,12 @@ test "live startup recovers existing journal segments in segment number order wh
     var expected_books = BookSet.init();
     var expected_output_buffer: [1024]u8 = undefined;
     var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
-    try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
+    try expected_writer.writeAll(command_help);
     try applyCommandEvent(&expected_writer, &expected_books, buy(1, 100, 10));
     try applyCommandEvent(&expected_writer, &expected_books, cancel(1));
-    expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
+    expected_writer.end = command_help.len;
     try applyCommandEvent(&expected_writer, &expected_books, sell(2, 100, 1));
-    try printState(&expected_writer, &expected_books);
+    try printInstrumentState(&expected_writer, &expected_books, default_instrument_id);
 
     try expectOutput(&recovered_writer, expected_writer.buffered());
     try expectBooksEqual(&expected_books, &recovered_books);
@@ -1286,7 +1295,7 @@ test "applyCommandEvent reports duplicate ids and leaves book unchanged" {
     try applySingleBookCommandEvent(&writer, &book, buy(1, 99, 5));
 
     try expectBookUnchanged(&before, &book);
-    try expectOutput(&writer, "ERROR DuplicateOrderId 1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 ERROR DuplicateOrderId 1\n");
 }
 
 test "applyCommandEvent reports missing cancels without changing the book" {
@@ -1299,7 +1308,7 @@ test "applyCommandEvent reports missing cancels without changing the book" {
     try applySingleBookCommandEvent(&writer, &book, cancel(404));
 
     try expectBookUnchanged(&before, &book);
-    try expectOutput(&writer, "NOT_FOUND 404\n");
+    try expectOutput(&writer, "INSTRUMENT 1 NOT_FOUND 404\n");
 }
 
 test "applyCommandEvent handles partial fills and fully filled orders" {
@@ -1317,8 +1326,8 @@ test "applyCommandEvent handles partial fills and fully filled orders" {
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
     try expectOutput(
         &writer,
-        "TRADE maker=1 taker=2 price=100 quantity=4\n" ++
-            "TRADE maker=1 taker=3 price=100 quantity=6\n",
+        "INSTRUMENT 1 TRADE maker=1 taker=2 price=100 quantity=4\n" ++
+            "INSTRUMENT 1 TRADE maker=1 taker=3 price=100 quantity=6\n",
     );
 }
 
@@ -1344,7 +1353,7 @@ test "a resting order beyond side capacity is rejected without changing the book
     const before_bids = book;
     try applySingleBookCommandEvent(&writer, &book, buy(200, 89, 1));
     try expectBookUnchanged(&before_bids, &book);
-    try expectOutput(&writer, "ERROR BookFull\n");
+    try expectOutput(&writer, "INSTRUMENT 1 ERROR BookFull\n");
 
     writer.end = 0;
     book = engine.OrderBook.init();
@@ -1352,7 +1361,7 @@ test "a resting order beyond side capacity is rejected without changing the book
     const before_asks = book;
     try applySingleBookCommandEvent(&writer, &book, sell(200, 111, 1));
     try expectBookUnchanged(&before_asks, &book);
-    try expectOutput(&writer, "ERROR BookFull\n");
+    try expectOutput(&writer, "INSTRUMENT 1 ERROR BookFull\n");
 }
 
 test "full own side accepts an incoming order that fully crosses" {
@@ -1366,7 +1375,7 @@ test "full own side accepts an incoming order that fully crosses" {
 
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
-    try expectOutput(&writer, "TRADE maker=200 taker=201 price=100 quantity=1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 TRADE maker=200 taker=201 price=100 quantity=1\n");
 }
 
 test "crossing order with residual is rejected when residual cannot rest" {
@@ -1380,7 +1389,7 @@ test "crossing order with residual is rejected when residual cannot rest" {
     try applySingleBookCommandEvent(&writer, &book, buy(201, 100, 2));
 
     try expectBookUnchanged(&before, &book);
-    try expectOutput(&writer, "ERROR BookFull\n");
+    try expectOutput(&writer, "INSTRUMENT 1 ERROR BookFull\n");
 }
 
 test "canceling a resting order frees capacity for another order" {
@@ -1395,7 +1404,7 @@ test "canceling a resting order frees capacity for another order" {
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expect(!book.containsOrder(1));
     try std.testing.expect(book.containsOrder(200));
-    try expectOutput(&writer, "CANCELED 1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 CANCELED 1\n");
 }
 
 test "fully filling a resting order frees capacity for another order" {
@@ -1410,5 +1419,5 @@ test "fully filling a resting order frees capacity for another order" {
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expect(!book.containsOrder(1));
     try std.testing.expect(book.containsOrder(201));
-    try expectOutput(&writer, "TRADE maker=1 taker=200 price=90 quantity=1\n");
+    try expectOutput(&writer, "INSTRUMENT 1 TRADE maker=1 taker=200 price=90 quantity=1\n");
 }

@@ -30,7 +30,7 @@ INSTRUMENT 2 BUY 3 101 7
 INSTRUMENT 2 CANCEL 3
 ```
 
-The program prints trades and the full book state after every command.
+The program prints trades and the targeted instrument book state after every command. Routed result lines include the instrument id because order ids are scoped per instrument.
 Commands without an `INSTRUMENT id` prefix use instrument `1`.
 Invalid syntax or unknown instruments are rejected before journaling. Parsed commands are appended before application, so deterministic rejects such as duplicate order id or book full replay as command attempts without mutating book state.
 
