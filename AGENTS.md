@@ -19,9 +19,17 @@ This file is a portable project-local snapshot. The repository must not require 
 - Instructions from unrelated directories do not apply.
 - Markdown links do not import instructions. Linked guidance is inactive unless its relevant text is copied here.
 
-## Project Brief
+## Canonical Project Documents
 
-The canonical project brief is [neon-match.md](neon-match.md). Keep goals, principles, scope, roadmap, and non-goals there.
+Each kind of durable project knowledge has one canonical home:
+
+- [ROADMAP.md](ROADMAP.md) defines high-level product direction and bounded project phases.
+- [neon-match.md](neon-match.md) is the canonical project brief for current architecture, principles, scope, and durable NeonMatch-specific engineering decisions.
+- `AGENTS.md` defines instructions for agents and contributors working in this repository tree.
+- GitHub issues hold detailed implementation work and short-term execution planning.
+- The current code and tests are authoritative for what is actually implemented.
+
+Do not duplicate the high-level roadmap into `neon-match.md` or detailed implementation plans into `ROADMAP.md`.
 
 ## Engineering Review
 
