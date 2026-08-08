@@ -595,6 +595,29 @@ fn writeCorruptJournalSegment(
     try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = writer.buffered() });
 }
 
+fn journalRecordCount(io: std.Io, path: []const u8) !usize {
+    var reader = try journal.Reader.open(io, path);
+    defer reader.close();
+
+    var count: usize = 0;
+    while (try reader.next()) |_| {
+        count += 1;
+    }
+    return count;
+}
+
+fn singleJournalPath(
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    journal_dir: []const u8,
+    buffer: []u8,
+) ![]const u8 {
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)) orelse return error.MissingJournalSegment;
+    try std.testing.expect((try it.next(io)) == null);
+    return try std.fmt.bufPrint(buffer, "{s}/{s}", .{ journal_dir, entry.name });
+}
+
 fn encodeJournalEvent(writer: *std.Io.Writer, event: CommandEvent) !void {
     switch (event) {
         .submit_limit => |instrumented| {
@@ -816,6 +839,125 @@ test "journal replay matches routed live input output and final book state" {
 
     var replay_books = BookSet.init();
     var replay_output_buffer: [4096]u8 = undefined;
+    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
+
+    try expectOutput(&replay_writer, live_writer.buffered());
+    try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "invalid routed instruments are not journaled and do not mutate books" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const commands =
+        "INSTRUMENT 0 BUY 1 100 5\n" ++
+        "INSTRUMENT 5 BUY 1 100 5\n";
+
+    var books = BookSet.init();
+    const before = books;
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var stdin = std.Io.Reader.fixed(commands);
+    try runLive(io, &stdin, &writer, &books, journal_dir);
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
+    try std.testing.expectEqual(@as(usize, 0), try journalRecordCount(io, journal_path));
+    try expectBooksEqual(&before, &books);
+    try expectOutput(
+        &writer,
+        "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n" ++
+            "ERROR UnknownInstrument\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "  ASKS\n" ++
+            "ERROR UnknownInstrument\n" ++
+            "BOOK\n" ++
+            "  BIDS\n" ++
+            "  ASKS\n",
+    );
+}
+
+test "routed duplicate id rejection is journaled without mutating any book" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const commands =
+        "INSTRUMENT 1 BUY 1 90 1\n" ++
+        "INSTRUMENT 2 BUY 1 91 1\n" ++
+        "INSTRUMENT 1 BUY 1 92 1\n";
+
+    var live_books = BookSet.init();
+    var live_output_buffer: [4096]u8 = undefined;
+    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
+    var stdin = std.Io.Reader.fixed(commands);
+    try runLive(io, &stdin, &live_writer, &live_books, journal_dir);
+
+    const book_1 = try live_books.bookFor(1);
+    const book_2 = try live_books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 1), book_1.bid_count);
+    try std.testing.expectEqual(@as(engine.Price, 90), book_1.bids[0].price);
+    try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
+    try std.testing.expectEqual(@as(engine.Price, 91), book_2.bids[0].price);
+    try std.testing.expect(std.mem.indexOf(u8, live_writer.buffered(), "ERROR DuplicateOrderId 1\n") != null);
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
+    try std.testing.expectEqual(@as(usize, 3), try journalRecordCount(io, journal_path));
+
+    var replay_books = BookSet.init();
+    var replay_output_buffer: [4096]u8 = undefined;
+    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
+
+    try expectOutput(&replay_writer, live_writer.buffered());
+    try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "routed book full rejection is journaled and isolated to the targeted book" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var commands_buffer: [8192]u8 = undefined;
+    var commands_writer = std.Io.Writer.fixed(&commands_buffer);
+    var id: engine.OrderId = 1;
+    while (id <= engine.max_orders) : (id += 1) {
+        try commands_writer.print("INSTRUMENT 2 BUY {d} 90 1\n", .{id});
+    }
+    try commands_writer.writeAll("INSTRUMENT 1 BUY 1 90 1\n");
+    try commands_writer.writeAll("INSTRUMENT 2 BUY 200 89 1\n");
+
+    var live_books = BookSet.init();
+    var live_output_buffer: [262144]u8 = undefined;
+    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
+    var stdin = std.Io.Reader.fixed(commands_writer.buffered());
+    try runLive(io, &stdin, &live_writer, &live_books, journal_dir);
+
+    const book_1 = try live_books.bookFor(1);
+    const book_2 = try live_books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 1), book_1.bid_count);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_1.bids[0].id);
+    try std.testing.expectEqual(@as(usize, engine.max_orders), book_2.bid_count);
+    try std.testing.expect(!book_2.containsOrder(200));
+    try std.testing.expect(std.mem.indexOf(u8, live_writer.buffered(), "ERROR BookFull\n") != null);
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
+    try std.testing.expectEqual(@as(usize, engine.max_orders + 2), try journalRecordCount(io, journal_path));
+
+    var replay_books = BookSet.init();
+    var replay_output_buffer: [262144]u8 = undefined;
     var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
     try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
 

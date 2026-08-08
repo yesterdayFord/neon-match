@@ -49,6 +49,9 @@ General rules:
 Admission and persistence:
 
 - The live admission path is `parse -> append -> apply`.
+- Syntactically invalid commands and commands for unknown instruments fail during parsing and are not appended.
+- Parsed command attempts are journaled before semantic application, including attempts that later produce deterministic errors such as duplicate order id or book full.
+- Semantically rejected command attempts must not mutate any book, but they remain part of the durable command stream.
 - A command must be completely appended to the OS-managed journal before it is applied to the engine.
 - Per-command stable-storage sync is not required before applying a command.
 - Stable-storage persistence is committed at controlled boundaries and during graceful shutdown.
