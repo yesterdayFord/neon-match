@@ -526,6 +526,20 @@ fn expectBooksEqual(expected: *const BookSet, actual: *const BookSet) !void {
     }
 }
 
+fn expectUntargetedBooksUnchanged(before: *const BookSet, after: *const BookSet, target_instrument_id: InstrumentId) !void {
+    const target_index = try instrumentIndex(target_instrument_id);
+    for (before.books, after.books, 0..) |before_book, after_book, index| {
+        if (index == target_index) continue;
+        try expectBookUnchanged(&before_book, &after_book);
+    }
+}
+
+fn validateBooks(books: *const BookSet) !void {
+    for (books.books) |book| {
+        try book.validate();
+    }
+}
+
 fn applySingleBookCommandEvent(
     writer: *std.Io.Writer,
     book: *engine.OrderBook,
@@ -667,6 +681,119 @@ fn encodeJournalRecord(writer: *std.Io.Writer, kind: u8, payload: []const u8) !v
     std.mem.writeInt(u32, header[10..14], std.hash.Crc32.hash(payload), .little);
     try writer.writeAll(&header);
     try writer.writeAll(payload);
+}
+
+const generated_history_max = 240;
+
+const GeneratedHistory = struct {
+    events: [generated_history_max]CommandEvent = undefined,
+    len: usize = 0,
+
+    fn append(self: *GeneratedHistory, event: CommandEvent) void {
+        std.debug.assert(self.len < self.events.len);
+        self.events[self.len] = event;
+        self.len += 1;
+    }
+
+    fn slice(self: *const GeneratedHistory) []const CommandEvent {
+        return self.events[0..self.len];
+    }
+};
+
+fn makeGeneratedHistory(seed: u64) GeneratedHistory {
+    var history = GeneratedHistory{};
+
+    history.append(instrumentSell(1, 1, 100, 5));
+    history.append(instrumentSell(1, 2, 101, 3));
+    history.append(instrumentBuy(1, 3, 101, 6));
+    history.append(instrumentBuy(2, 1, std.math.maxInt(engine.Price), 1));
+    history.append(instrumentBuy(2, 1, std.math.maxInt(engine.Price) - 1, 1));
+    history.append(instrumentCancel(3, 999));
+    history.append(instrumentBuy(3, std.math.maxInt(engine.OrderId), std.math.maxInt(engine.Price), std.math.maxInt(engine.Quantity)));
+
+    var full_id: engine.OrderId = 10_000;
+    while (full_id < 10_000 + engine.max_orders) : (full_id += 1) {
+        history.append(instrumentBuy(4, full_id, 90, 1));
+    }
+    history.append(instrumentBuy(4, 20_000, 89, 1));
+
+    var state = seed;
+    var next_id: engine.OrderId = 30_000;
+    var index: usize = 0;
+    while (index < 72) : (index += 1) {
+        const value = nextGeneratedValue(&state);
+        const instrument_id: InstrumentId = @intCast(1 + (value % max_instruments));
+        const selector = value % 10;
+
+        if (selector == 0) {
+            history.append(instrumentCancel(instrument_id, 700_000 + @as(engine.OrderId, @intCast(index))));
+            continue;
+        }
+
+        if (selector == 1) {
+            history.append(instrumentBuy(instrument_id, 1, 95 + @as(engine.Price, @intCast(value % 9)), 1));
+            continue;
+        }
+
+        next_id += 1;
+        const price: engine.Price = 95 + @as(engine.Price, @intCast((value >> 8) % 11));
+        const quantity: engine.Quantity = 1 + @as(engine.Quantity, @intCast((value >> 16) % 7));
+        if ((value & 1) == 0) {
+            history.append(instrumentBuy(instrument_id, next_id, price, quantity));
+        } else {
+            history.append(instrumentSell(instrument_id, next_id, price, quantity));
+        }
+    }
+
+    return history;
+}
+
+fn nextGeneratedValue(state: *u64) u64 {
+    state.* = state.* *% 6364136223846793005 +% 1442695040888963407;
+    return state.*;
+}
+
+fn expectGeneratedHistoryInvariants(seed: u64, events: []const CommandEvent) !void {
+    var books = BookSet.init();
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    for (events, 0..) |event, index| {
+        const before = books;
+        const output_start = writer.end;
+        applyCommandEvent(&writer, &books, event) catch |err| return failGenerated(seed, index, err);
+        validateBooks(&books) catch |err| return failGenerated(seed, index, err);
+        expectUntargetedBooksUnchanged(&before, &books, commandEventInstrumentId(event)) catch |err| return failGenerated(seed, index, err);
+
+        const command_output = writer.buffered()[output_start..writer.end];
+        const rejected = std.mem.indexOf(u8, command_output, "ERROR") != null or
+            std.mem.indexOf(u8, command_output, "NOT_FOUND") != null;
+        if (rejected) {
+            expectBooksEqual(&before, &books) catch |err| return failGenerated(seed, index, err);
+        }
+
+        writer.end = 0;
+    }
+}
+
+fn runJournaledGeneratedHistory(
+    writer: *std.Io.Writer,
+    books: *BookSet,
+    segment: *journal.Segment,
+    seed: u64,
+    events: []const CommandEvent,
+) !void {
+    try writer.writeAll(command_help);
+    for (events, 0..) |event, index| {
+        applyJournaledCommand(writer, books, segment, event) catch |err| return failGenerated(seed, index, err);
+        validateBooks(books) catch |err| return failGenerated(seed, index, err);
+        printInstrumentState(writer, books, commandEventInstrumentId(event)) catch |err| return failGenerated(seed, index, err);
+    }
+}
+
+fn failGenerated(seed: u64, command_index: usize, err: anyerror) anyerror {
+    std.debug.print("generated history failed seed={d} command_index={d}: {s}\n", .{ seed, command_index, @errorName(err) });
+    return err;
 }
 
 test "parse buy sell and cancel commands into command events" {
@@ -972,6 +1099,55 @@ test "routed book full rejection is journaled and isolated to the targeted book"
     try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
     try expectBooksEqual(&before, &books);
     try expectOutput(&writer, "INSTRUMENT 2 ERROR BookFull\n");
+}
+
+test "generated routed command histories preserve invariants and rejection boundaries" {
+    const seeds = [_]u64{
+        0x0000_0000_0000_0001,
+        0x0000_0000_cafe_f00d,
+        0x9e37_79b9_7f4a_7c15,
+    };
+
+    for (seeds) |seed| {
+        const history = makeGeneratedHistory(seed);
+        try expectGeneratedHistoryInvariants(seed, history.slice());
+    }
+}
+
+test "generated routed histories replay and recover to the live journaled result" {
+    const io = std.testing.io;
+    const seed: u64 = 0xfeed_face_1234_5678;
+    const history = makeGeneratedHistory(seed);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var segment = try journal.Segment.open(io, journal_dir);
+    var live_books = BookSet.init();
+    var live_output_buffer: [1024 * 1024]u8 = undefined;
+    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
+    try runJournaledGeneratedHistory(&live_writer, &live_books, &segment, seed, history.slice());
+    segment.close();
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
+
+    var replay_books = BookSet.init();
+    var replay_output_buffer: [1024 * 1024]u8 = undefined;
+    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
+    try validateBooks(&replay_books);
+
+    try expectOutput(&replay_writer, live_writer.buffered());
+    try expectBooksEqual(&live_books, &replay_books);
+
+    var recovered_books = BookSet.init();
+    try recoverJournalDir(io, &recovered_books, journal_dir);
+    try validateBooks(&recovered_books);
+    try expectBooksEqual(&live_books, &recovered_books);
 }
 
 test "startup recovery preserves routed journal state" {

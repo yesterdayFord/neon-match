@@ -433,3 +433,87 @@ test "duplicate order id can be detected before submit" {
 
     try std.testing.expect(book.containsOrder(1));
 }
+
+test "validator accepts an empty or valid resting book" {
+    var book = OrderBook.init();
+
+    try book.validate();
+    _ = book.submitLimit(buy(1, 101, 2));
+    _ = book.submitLimit(buy(2, 100, 3));
+    _ = book.submitLimit(sell(3, 102, 4));
+    _ = book.submitLimit(sell(4, 103, 5));
+
+    try book.validate();
+}
+
+test "validator accepts equal-price FIFO represented by array order" {
+    var book = OrderBook.init();
+
+    _ = book.submitLimit(buy(1, 100, 1));
+    _ = book.submitLimit(buy(2, 100, 1));
+    _ = book.submitLimit(sell(3, 101, 1));
+    _ = book.submitLimit(sell(4, 101, 1));
+
+    try book.validate();
+}
+
+test "validator detects invalid capacity counts" {
+    var book = OrderBook.init();
+    book.bid_count = engine.max_orders + 1;
+    try std.testing.expectError(error.InvalidOrderBookBidCount, book.validate());
+
+    book = OrderBook.init();
+    book.ask_count = engine.max_orders + 1;
+    try std.testing.expectError(error.InvalidOrderBookAskCount, book.validate());
+}
+
+test "validator detects zero resting quantities" {
+    var book = OrderBook.init();
+    book.bids[0] = buy(1, 100, 0);
+    book.bid_count = 1;
+    try std.testing.expectError(error.InvalidOrderBookQuantity, book.validate());
+}
+
+test "validator detects duplicate active order ids within one book" {
+    var book = OrderBook.init();
+    book.bids[0] = buy(1, 101, 1);
+    book.bids[1] = buy(1, 100, 1);
+    book.bid_count = 2;
+    try std.testing.expectError(error.InvalidOrderBookDuplicateId, book.validate());
+
+    book = OrderBook.init();
+    book.bids[0] = buy(1, 100, 1);
+    book.asks[0] = sell(1, 101, 1);
+    book.bid_count = 1;
+    book.ask_count = 1;
+    try std.testing.expectError(error.InvalidOrderBookDuplicateId, book.validate());
+}
+
+test "validator detects side and price ordering violations" {
+    var book = OrderBook.init();
+    book.bids[0] = sell(1, 101, 1);
+    book.bid_count = 1;
+    try std.testing.expectError(error.InvalidOrderBookSide, book.validate());
+
+    book = OrderBook.init();
+    book.bids[0] = buy(1, 100, 1);
+    book.bids[1] = buy(2, 101, 1);
+    book.bid_count = 2;
+    try std.testing.expectError(error.InvalidOrderBookBidSort, book.validate());
+
+    book = OrderBook.init();
+    book.asks[0] = sell(1, 101, 1);
+    book.asks[1] = sell(2, 100, 1);
+    book.ask_count = 2;
+    try std.testing.expectError(error.InvalidOrderBookAskSort, book.validate());
+}
+
+test "validator detects crossed resting books" {
+    var book = OrderBook.init();
+    book.bids[0] = buy(1, 100, 1);
+    book.asks[0] = sell(2, 100, 1);
+    book.bid_count = 1;
+    book.ask_count = 1;
+
+    try std.testing.expectError(error.InvalidOrderBookCrossed, book.validate());
+}

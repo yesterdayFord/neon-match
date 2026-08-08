@@ -97,6 +97,19 @@ pub const OrderBook = struct {
         };
     }
 
+    pub fn validate(self: *const OrderBook) !void {
+        if (self.bid_count > self.bids.len) return error.InvalidOrderBookBidCount;
+        if (self.ask_count > self.asks.len) return error.InvalidOrderBookAskCount;
+
+        try validateSide(self.bids[0..self.bid_count], .buy);
+        try validateSide(self.asks[0..self.ask_count], .sell);
+        try validateUniqueIds(self.bids[0..self.bid_count], self.asks[0..self.ask_count]);
+
+        if (self.bid_count > 0 and self.ask_count > 0 and self.bids[0].price >= self.asks[0].price) {
+            return error.InvalidOrderBookCrossed;
+        }
+    }
+
     pub fn restingQuantityAfterMatch(self: *const OrderBook, order: Order) Quantity {
         assert(order.quantity > 0);
 
@@ -197,6 +210,32 @@ pub const OrderBook = struct {
         return null;
     }
 };
+
+fn validateSide(orders: []const Order, side: Side) !void {
+    for (orders, 0..) |order, index| {
+        if (order.side != side) return error.InvalidOrderBookSide;
+        if (order.quantity == 0) return error.InvalidOrderBookQuantity;
+
+        if (index > 0) {
+            const previous = orders[index - 1];
+            switch (side) {
+                .buy => if (previous.price < order.price) return error.InvalidOrderBookBidSort,
+                .sell => if (previous.price > order.price) return error.InvalidOrderBookAskSort,
+            }
+        }
+    }
+}
+
+fn validateUniqueIds(bids: []const Order, asks: []const Order) !void {
+    for (bids, 0..) |order, index| {
+        if (findIn(bids[index + 1 ..], order.id) != null) return error.InvalidOrderBookDuplicateId;
+        if (findIn(asks, order.id) != null) return error.InvalidOrderBookDuplicateId;
+    }
+
+    for (asks, 0..) |order, index| {
+        if (findIn(asks[index + 1 ..], order.id) != null) return error.InvalidOrderBookDuplicateId;
+    }
+}
 
 fn findIn(orders: []const Order, id: OrderId) ?usize {
     for (orders, 0..) |order, index| {
