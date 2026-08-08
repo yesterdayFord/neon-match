@@ -3,9 +3,44 @@ const engine = @import("engine.zig");
 const journal = @import("journal.zig");
 
 pub const CommandEvent = union(enum) {
-    submit_limit: engine.Order,
-    cancel: engine.OrderId,
+    submit_limit: InstrumentedOrder,
+    cancel: InstrumentedCancel,
 };
+
+pub const InstrumentId = u32;
+pub const default_instrument_id: InstrumentId = 1;
+pub const max_instruments = 4;
+
+pub const InstrumentedOrder = struct {
+    instrument_id: InstrumentId,
+    order: engine.Order,
+};
+
+pub const InstrumentedCancel = struct {
+    instrument_id: InstrumentId,
+    order_id: engine.OrderId,
+};
+
+const BookSet = struct {
+    books: [max_instruments]engine.OrderBook,
+
+    fn init() BookSet {
+        var books: [max_instruments]engine.OrderBook = undefined;
+        for (&books) |*book| {
+            book.* = engine.OrderBook.init();
+        }
+        return .{ .books = books };
+    }
+
+    fn bookFor(self: *BookSet, instrument_id: InstrumentId) !*engine.OrderBook {
+        return &self.books[try instrumentIndex(instrument_id)];
+    }
+};
+
+fn instrumentIndex(instrument_id: InstrumentId) !usize {
+    if (instrument_id == 0 or instrument_id > max_instruments) return error.UnknownInstrument;
+    return @intCast(instrument_id - 1);
+}
 
 const RunMode = union(enum) {
     live: []const u8,
@@ -38,10 +73,10 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     const mode = try parseArgs(&args);
 
-    var book = engine.OrderBook.init();
+    var books = BookSet.init();
     switch (mode) {
-        .live => |journal_dir| try runLive(io, stdin, stdout, &book, journal_dir),
-        .replay => |journal_path| try replayJournalPath(io, stdout, &book, journal_path),
+        .live => |journal_dir| try runLive(io, stdin, stdout, &books, journal_dir),
+        .replay => |journal_path| try replayJournalPath(io, stdout, &books, journal_path),
     }
     try stdout.flush();
 }
@@ -50,11 +85,11 @@ fn runLive(
     io: std.Io,
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
-    book: *engine.OrderBook,
+    books: *BookSet,
     journal_dir: []const u8,
 ) !void {
     var line_buffer: [256]u8 = undefined;
-    try recoverJournalDir(io, book, journal_dir);
+    try recoverJournalDir(io, books, journal_dir);
     var journal_segment = try journal.Segment.open(io, journal_dir);
     defer journal_segment.close();
 
@@ -67,21 +102,21 @@ fn runLive(
 
         const event = parseCommandEvent(trimmed) catch |err| {
             try stdout.print("ERROR {s}\n", .{@errorName(err)});
-            try printState(stdout, book);
+            try printState(stdout, books);
             try stdout.flush();
             continue;
         };
 
-        try applyJournaledCommand(stdout, book, &journal_segment, event);
+        try applyJournaledCommand(stdout, books, &journal_segment, event);
 
-        try printState(stdout, book);
+        try printState(stdout, books);
         try stdout.flush();
     }
 }
 
 fn recoverJournalDir(
     io: std.Io,
-    book: *engine.OrderBook,
+    books: *BookSet,
     journal_dir: []const u8,
 ) !void {
     var created_dir = try std.Io.Dir.cwd().createDirPathOpen(io, journal_dir, .{});
@@ -112,7 +147,7 @@ fn recoverJournalDir(
     try validateUniqueSegmentNumbers(segments[0..segment_count]);
 
     for (segments[0..segment_count], 0..) |*segment, index| {
-        try recoverJournalPath(io, book, segment.slice(), index + 1 == segment_count);
+        try recoverJournalPath(io, books, segment.slice(), index + 1 == segment_count);
     }
 }
 
@@ -145,7 +180,7 @@ fn validateUniqueSegmentNumbers(segments: []const JournalSegmentPath) !void {
 
 fn recoverJournalPath(
     io: std.Io,
-    book: *engine.OrderBook,
+    books: *BookSet,
     path: []const u8,
     is_final_segment: bool,
 ) !void {
@@ -155,7 +190,7 @@ fn recoverJournalPath(
     var output_buffer: [max_recovery_output_len]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
     while (try reader.next()) |record| {
-        try applyCommandEvent(&writer, book, commandEventFromJournalRecord(record));
+        try applyCommandEvent(&writer, books, commandEventFromJournalRecord(record));
         writer.end = 0;
     }
 
@@ -193,63 +228,73 @@ fn isExecutableArg(arg: []const u8) bool {
 
 fn applyJournaledCommand(
     writer: *std.Io.Writer,
-    book: *engine.OrderBook,
+    books: *BookSet,
     segment: anytype,
     event: CommandEvent,
 ) !void {
     try appendJournalEvent(segment, event);
-    try applyCommandEvent(writer, book, event);
+    try applyCommandEvent(writer, books, event);
 }
 
 fn appendJournalEvent(segment: anytype, event: CommandEvent) !void {
     switch (event) {
-        .submit_limit => |order| try segment.appendSubmitLimit(order),
-        .cancel => |id| try segment.appendCancel(id),
+        .submit_limit => |instrumented| try segment.appendSubmitLimit(instrumented.instrument_id, instrumented.order),
+        .cancel => |instrumented| try segment.appendCancel(instrumented.instrument_id, instrumented.order_id),
     }
 }
 
 pub fn replayJournalPath(
     io: std.Io,
     writer: *std.Io.Writer,
-    book: *engine.OrderBook,
+    books: *BookSet,
     path: []const u8,
 ) !void {
     var reader = try journal.Reader.open(io, path);
     defer reader.close();
-    try replayJournal(writer, book, &reader);
+    try replayJournal(writer, books, &reader);
 }
 
 pub fn replayJournal(
     writer: *std.Io.Writer,
-    book: *engine.OrderBook,
+    books: *BookSet,
     reader: *journal.Reader,
 ) !void {
     try writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
     while (try reader.next()) |record| {
-        try applyCommandEvent(writer, book, commandEventFromJournalRecord(record));
-        try printState(writer, book);
+        try applyCommandEvent(writer, books, commandEventFromJournalRecord(record));
+        try printState(writer, books);
     }
 }
 
 fn commandEventFromJournalRecord(record: journal.Record) CommandEvent {
     return switch (record) {
-        .submit_limit => |order| .{ .submit_limit = order },
-        .cancel => |id| .{ .cancel = id },
+        .submit_limit => |instrumented| .{ .submit_limit = .{
+            .instrument_id = instrumented.instrument_id,
+            .order = instrumented.order,
+        } },
+        .cancel => |instrumented| .{ .cancel = .{
+            .instrument_id = instrumented.instrument_id,
+            .order_id = instrumented.order_id,
+        } },
     };
 }
 
 pub fn applyCommandEvent(
     writer: *std.Io.Writer,
-    book: *engine.OrderBook,
+    books: *BookSet,
     event: CommandEvent,
 ) !void {
     switch (event) {
-        .submit_limit => |order| {
+        .submit_limit => |instrumented| {
+            const book = try books.bookFor(instrumented.instrument_id);
+            const order = instrumented.order;
             if (!try canAccept(writer, book, order)) return;
             const result = book.submitLimit(order);
             try printTrades(writer, &result);
         },
-        .cancel => |id| {
+        .cancel => |instrumented| {
+            const book = try books.bookFor(instrumented.instrument_id);
+            const id = instrumented.order_id;
             if (book.cancel(id)) {
                 try writer.print("CANCELED {d}\n", .{id});
             } else {
@@ -297,25 +342,49 @@ fn parseCommandEvent(line: []const u8) !CommandEvent {
     var tokens = std.mem.tokenizeAny(u8, line, " \t\r\n");
     const verb = tokens.next() orelse return error.EmptyCommand;
 
+    if (std.mem.eql(u8, verb, "INSTRUMENT")) {
+        const instrument_text = tokens.next() orelse return error.MissingInstrumentId;
+        const instrument_id = try parseInstrumentId(instrument_text);
+        const routed_verb = tokens.next() orelse return error.MissingCommand;
+        return parseRoutedCommandEvent(&tokens, routed_verb, instrument_id);
+    }
+
+    return parseRoutedCommandEvent(&tokens, verb, default_instrument_id);
+}
+
+fn parseRoutedCommandEvent(
+    tokens: *std.mem.TokenIterator(u8, .any),
+    verb: []const u8,
+    instrument_id: InstrumentId,
+) !CommandEvent {
     if (std.mem.eql(u8, verb, "BUY")) {
-        const order = try parseInputOrder(&tokens, .buy);
+        const order = try parseInputOrder(tokens, .buy);
         if (tokens.next() != null) return error.TooManyFields;
-        return .{ .submit_limit = order };
+        return .{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
     }
 
     if (std.mem.eql(u8, verb, "SELL")) {
-        const order = try parseInputOrder(&tokens, .sell);
+        const order = try parseInputOrder(tokens, .sell);
         if (tokens.next() != null) return error.TooManyFields;
-        return .{ .submit_limit = order };
+        return .{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
     }
 
     if (std.mem.eql(u8, verb, "CANCEL")) {
         const id_text = tokens.next() orelse return error.MissingOrderId;
         if (tokens.next() != null) return error.TooManyFields;
-        return .{ .cancel = try parsePositive(engine.OrderId, id_text) };
+        return .{ .cancel = .{
+            .instrument_id = instrument_id,
+            .order_id = try parsePositive(engine.OrderId, id_text),
+        } };
     }
 
     return error.UnknownCommand;
+}
+
+fn parseInstrumentId(text: []const u8) !InstrumentId {
+    const instrument_id = try std.fmt.parseInt(InstrumentId, text, 10);
+    _ = try instrumentIndex(instrument_id);
+    return instrument_id;
 }
 
 fn parseInputOrder(tokens: *std.mem.TokenIterator(u8, .any), side: engine.Side) !engine.Order {
@@ -348,7 +417,36 @@ fn printTrades(writer: *std.Io.Writer, result: *const engine.MatchResult) !void 
     }
 }
 
-fn printState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
+fn printState(writer: *std.Io.Writer, books: *const BookSet) !void {
+    var active_count: usize = 0;
+    for (books.books) |book| {
+        if (book.bid_count > 0 or book.ask_count > 0) active_count += 1;
+    }
+    if (active_count <= 1) {
+        const default_index = instrumentIndex(default_instrument_id) catch unreachable;
+        const active_index = if (active_count == 0)
+            default_index
+        else blk: {
+            for (books.books, 0..) |book, index| {
+                if (book.bid_count > 0 or book.ask_count > 0) break :blk index;
+            }
+            unreachable;
+        };
+        if (active_index != default_index) try writer.print("INSTRUMENT {d}\n", .{active_index + 1});
+        try printSingleBookState(writer, &books.books[active_index]);
+        return;
+    }
+
+    var index: usize = 0;
+    while (index < books.books.len) : (index += 1) {
+        const book = &books.books[index];
+        if (book.bid_count == 0 and book.ask_count == 0) continue;
+        try writer.print("INSTRUMENT {d}\n", .{index + 1});
+        try printSingleBookState(writer, book);
+    }
+}
+
+fn printSingleBookState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
     try writer.writeAll("BOOK\n");
     try writer.writeAll("  BIDS\n");
     var bid_index: usize = 0;
@@ -366,15 +464,33 @@ fn printState(writer: *std.Io.Writer, book: *const engine.OrderBook) !void {
 }
 
 fn buy(id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
-    return .{ .submit_limit = .{ .id = id, .side = .buy, .price = price, .quantity = quantity } };
+    return instrumentBuy(default_instrument_id, id, price, quantity);
 }
 
 fn sell(id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
-    return .{ .submit_limit = .{ .id = id, .side = .sell, .price = price, .quantity = quantity } };
+    return instrumentSell(default_instrument_id, id, price, quantity);
 }
 
 fn cancel(id: engine.OrderId) CommandEvent {
-    return .{ .cancel = id };
+    return instrumentCancel(default_instrument_id, id);
+}
+
+fn instrumentBuy(instrument_id: InstrumentId, id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
+    return .{ .submit_limit = .{
+        .instrument_id = instrument_id,
+        .order = .{ .id = id, .side = .buy, .price = price, .quantity = quantity },
+    } };
+}
+
+fn instrumentSell(instrument_id: InstrumentId, id: engine.OrderId, price: engine.Price, quantity: engine.Quantity) CommandEvent {
+    return .{ .submit_limit = .{
+        .instrument_id = instrument_id,
+        .order = .{ .id = id, .side = .sell, .price = price, .quantity = quantity },
+    } };
+}
+
+fn instrumentCancel(instrument_id: InstrumentId, id: engine.OrderId) CommandEvent {
+    return .{ .cancel = .{ .instrument_id = instrument_id, .order_id = id } };
 }
 
 fn expectOutput(writer: *const std.Io.Writer, expected: []const u8) !void {
@@ -388,8 +504,33 @@ fn expectBookUnchanged(before: *const engine.OrderBook, after: *const engine.Ord
     try std.testing.expectEqualSlices(engine.Order, before.asks[0..before.ask_count], after.asks[0..after.ask_count]);
 }
 
-fn expectBooksEqual(expected: *const engine.OrderBook, actual: *const engine.OrderBook) !void {
-    try expectBookUnchanged(expected, actual);
+fn expectBooksEqual(expected: *const BookSet, actual: *const BookSet) !void {
+    for (expected.books, actual.books) |expected_book, actual_book| {
+        try expectBookUnchanged(&expected_book, &actual_book);
+    }
+}
+
+fn applySingleBookCommandEvent(
+    writer: *std.Io.Writer,
+    book: *engine.OrderBook,
+    event: CommandEvent,
+) !void {
+    var books = BookSet.init();
+    books.books[instrumentIndex(default_instrument_id) catch unreachable] = book.*;
+    try applyCommandEvent(writer, &books, event);
+    book.* = books.books[instrumentIndex(default_instrument_id) catch unreachable];
+}
+
+fn applyJournaledCommandToSingleBook(
+    writer: *std.Io.Writer,
+    book: *engine.OrderBook,
+    segment: anytype,
+    event: CommandEvent,
+) !void {
+    var books = BookSet.init();
+    books.books[instrumentIndex(default_instrument_id) catch unreachable] = book.*;
+    try applyJournaledCommand(writer, &books, segment, event);
+    book.* = books.books[instrumentIndex(default_instrument_id) catch unreachable];
 }
 
 fn fillSideWithRestingOrders(
@@ -405,7 +546,7 @@ fn fillSideWithRestingOrders(
             .buy => buy(id, 90, 1),
             .sell => sell(id, 110, 1),
         };
-        try applyCommandEvent(writer, book, event);
+        try applySingleBookCommandEvent(writer, book, event);
     }
 }
 
@@ -456,20 +597,23 @@ fn writeCorruptJournalSegment(
 
 fn encodeJournalEvent(writer: *std.Io.Writer, event: CommandEvent) !void {
     switch (event) {
-        .submit_limit => |order| {
-            var payload: [25]u8 = undefined;
-            payload[0] = switch (order.side) {
+        .submit_limit => |instrumented| {
+            const order = instrumented.order;
+            var payload: [29]u8 = undefined;
+            std.mem.writeInt(u32, payload[0..4], instrumented.instrument_id, .little);
+            payload[4] = switch (order.side) {
                 .buy => 1,
                 .sell => 2,
             };
-            std.mem.writeInt(u64, payload[1..9], order.id, .little);
-            std.mem.writeInt(u64, payload[9..17], order.price, .little);
-            std.mem.writeInt(u64, payload[17..25], order.quantity, .little);
+            std.mem.writeInt(u64, payload[5..13], order.id, .little);
+            std.mem.writeInt(u64, payload[13..21], order.price, .little);
+            std.mem.writeInt(u64, payload[21..29], order.quantity, .little);
             try encodeJournalRecord(writer, 1, &payload);
         },
-        .cancel => |id| {
-            var payload: [8]u8 = undefined;
-            std.mem.writeInt(u64, &payload, id, .little);
+        .cancel => |instrumented| {
+            var payload: [12]u8 = undefined;
+            std.mem.writeInt(u32, payload[0..4], instrumented.instrument_id, .little);
+            std.mem.writeInt(u64, payload[4..12], instrumented.order_id, .little);
             try encodeJournalRecord(writer, 2, &payload);
         },
     }
@@ -478,7 +622,7 @@ fn encodeJournalEvent(writer: *std.Io.Writer, event: CommandEvent) !void {
 fn encodeJournalRecord(writer: *std.Io.Writer, kind: u8, payload: []const u8) !void {
     var header: [14]u8 = undefined;
     @memcpy(header[0..4], "NMJ1");
-    header[4] = 1;
+    header[4] = 2;
     header[5] = kind;
     std.mem.writeInt(u32, header[6..10], @intCast(payload.len), .little);
     std.mem.writeInt(u32, header[10..14], std.hash.Crc32.hash(payload), .little);
@@ -488,21 +632,38 @@ fn encodeJournalRecord(writer: *std.Io.Writer, kind: u8, payload: []const u8) !v
 
 test "parse buy sell and cancel commands into command events" {
     const buy_event = try parseCommandEvent("BUY 1 100 10");
-    const buy_order = buy_event.submit_limit;
+    const buy_order = buy_event.submit_limit.order;
+    try std.testing.expectEqual(default_instrument_id, buy_event.submit_limit.instrument_id);
     try std.testing.expectEqual(engine.Side.buy, buy_order.side);
     try std.testing.expectEqual(@as(engine.OrderId, 1), buy_order.id);
     try std.testing.expectEqual(@as(engine.Price, 100), buy_order.price);
     try std.testing.expectEqual(@as(engine.Quantity, 10), buy_order.quantity);
 
     const sell_event = try parseCommandEvent("SELL 2 110 5");
-    const sell_order = sell_event.submit_limit;
+    const sell_order = sell_event.submit_limit.order;
+    try std.testing.expectEqual(default_instrument_id, sell_event.submit_limit.instrument_id);
     try std.testing.expectEqual(engine.Side.sell, sell_order.side);
     try std.testing.expectEqual(@as(engine.OrderId, 2), sell_order.id);
     try std.testing.expectEqual(@as(engine.Price, 110), sell_order.price);
     try std.testing.expectEqual(@as(engine.Quantity, 5), sell_order.quantity);
 
     const cancel_event = try parseCommandEvent("CANCEL 2");
-    try std.testing.expectEqual(@as(engine.OrderId, 2), cancel_event.cancel);
+    try std.testing.expectEqual(default_instrument_id, cancel_event.cancel.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 2), cancel_event.cancel.order_id);
+}
+
+test "parse explicit instrument prefix into routed command events" {
+    const buy_event = try parseCommandEvent("INSTRUMENT 2 BUY 1 100 10");
+    try std.testing.expectEqual(@as(InstrumentId, 2), buy_event.submit_limit.instrument_id);
+    try std.testing.expectEqual(engine.Side.buy, buy_event.submit_limit.order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), buy_event.submit_limit.order.id);
+
+    const cancel_event = try parseCommandEvent("INSTRUMENT 2 CANCEL 1");
+    try std.testing.expectEqual(@as(InstrumentId, 2), cancel_event.cancel.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), cancel_event.cancel.order_id);
+
+    try std.testing.expectError(error.UnknownInstrument, parseCommandEvent("INSTRUMENT 0 BUY 1 100 10"));
+    try std.testing.expectError(error.UnknownInstrument, parseCommandEvent("INSTRUMENT 5 BUY 1 100 10"));
 }
 
 test "buy sell and cancel events can be applied without stdin" {
@@ -510,9 +671,9 @@ test "buy sell and cancel events can be applied without stdin" {
     var output_buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
-    try applyCommandEvent(&writer, &book, sell(2, 110, 5));
-    try applyCommandEvent(&writer, &book, cancel(1));
+    try applySingleBookCommandEvent(&writer, &book, buy(1, 100, 10));
+    try applySingleBookCommandEvent(&writer, &book, sell(2, 110, 5));
+    try applySingleBookCommandEvent(&writer, &book, cancel(1));
 
     try std.testing.expect(!book.containsOrder(1));
     try std.testing.expect(book.containsOrder(2));
@@ -534,8 +695,10 @@ test "direct command event replay matches stdin fixture output" {
         cancel(2),
     };
     for (events) |event| {
-        try applyCommandEvent(&writer, &book, event);
-        try printState(&writer, &book);
+        try applySingleBookCommandEvent(&writer, &book, event);
+        var books = BookSet.init();
+        books.books[instrumentIndex(default_instrument_id) catch unreachable] = book;
+        try printState(&writer, &books);
     }
 
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -552,6 +715,45 @@ test "direct command event replay matches stdin fixture output" {
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
 }
 
+test "routed commands only match within the targeted instrument" {
+    var books = BookSet.init();
+    var output_buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try applyCommandEvent(&writer, &books, instrumentSell(1, 1, 100, 5));
+    try applyCommandEvent(&writer, &books, instrumentBuy(2, 1, 100, 5));
+    try expectOutput(&writer, "");
+
+    const book_1 = try books.bookFor(1);
+    const book_2 = try books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 1), book_1.ask_count);
+    try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_1.asks[0].id);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_2.bids[0].id);
+
+    try applyCommandEvent(&writer, &books, instrumentBuy(1, 2, 100, 5));
+    try expectOutput(&writer, "TRADE maker=1 taker=2 price=100 quantity=5\n");
+    try std.testing.expectEqual(@as(usize, 0), book_1.ask_count);
+    try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
+}
+
+test "cancel only affects the targeted instrument" {
+    var books = BookSet.init();
+    var output_buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try applyCommandEvent(&writer, &books, instrumentBuy(1, 1, 90, 1));
+    try applyCommandEvent(&writer, &books, instrumentBuy(2, 1, 90, 1));
+    try applyCommandEvent(&writer, &books, instrumentCancel(1, 1));
+
+    const book_1 = try books.bookFor(1);
+    const book_2 = try books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 0), book_1.bid_count);
+    try std.testing.expectEqual(@as(usize, 1), book_2.bid_count);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_2.bids[0].id);
+    try expectOutput(&writer, "CANCELED 1\n");
+}
+
 test "journal replay matches live input output and final book state" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -566,11 +768,11 @@ test "journal replay matches live input output and final book state" {
         "BUY 4 110 8\n" ++
         "CANCEL 2\n";
 
-    var live_book = engine.OrderBook.init();
+    var live_books = BookSet.init();
     var live_output_buffer: [2048]u8 = undefined;
     var live_writer = std.Io.Writer.fixed(&live_output_buffer);
     var stdin = std.Io.Reader.fixed(commands);
-    try runLive(io, &stdin, &live_writer, &live_book, journal_dir);
+    try runLive(io, &stdin, &live_writer, &live_books, journal_dir);
 
     var it = tmp.dir.iterate();
     const entry = (try it.next(io)) orelse return error.MissingJournalSegment;
@@ -578,13 +780,74 @@ test "journal replay matches live input output and final book state" {
     var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const journal_path = try std.fmt.bufPrint(&journal_path_buffer, "{s}/{s}", .{ journal_dir, entry.name });
 
-    var replay_book = engine.OrderBook.init();
+    var replay_books = BookSet.init();
     var replay_output_buffer: [2048]u8 = undefined;
     var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
-    try replayJournalPath(io, &replay_writer, &replay_book, journal_path);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
 
     try expectOutput(&replay_writer, live_writer.buffered());
-    try expectBooksEqual(&live_book, &replay_book);
+    try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "journal replay matches routed live input output and final book state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const commands =
+        "INSTRUMENT 1 SELL 1 100 5\n" ++
+        "INSTRUMENT 2 BUY 1 100 5\n" ++
+        "INSTRUMENT 1 BUY 2 100 5\n" ++
+        "INSTRUMENT 2 CANCEL 1\n";
+
+    var live_books = BookSet.init();
+    var live_output_buffer: [4096]u8 = undefined;
+    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
+    var stdin = std.Io.Reader.fixed(commands);
+    try runLive(io, &stdin, &live_writer, &live_books, journal_dir);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)) orelse return error.MissingJournalSegment;
+    try std.testing.expect((try it.next(io)) == null);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try std.fmt.bufPrint(&journal_path_buffer, "{s}/{s}", .{ journal_dir, entry.name });
+
+    var replay_books = BookSet.init();
+    var replay_output_buffer: [4096]u8 = undefined;
+    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
+
+    try expectOutput(&replay_writer, live_writer.buffered());
+    try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "startup recovery preserves routed journal state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    try writeJournalSegment(
+        tmp.dir,
+        "journal-20260730T014500Z-000001.nmj",
+        &.{
+            instrumentSell(2, 1, 100, 5),
+            instrumentBuy(1, 1, 100, 5),
+        },
+    );
+
+    var recovered_books = BookSet.init();
+    try recoverJournalDir(io, &recovered_books, journal_dir);
+
+    const book_1 = try recovered_books.bookFor(1);
+    const book_2 = try recovered_books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 1), book_1.bid_count);
+    try std.testing.expectEqual(@as(usize, 1), book_2.ask_count);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_1.bids[0].id);
+    try std.testing.expectEqual(@as(engine.OrderId, 1), book_2.asks[0].id);
 }
 
 test "live startup recovers existing journal segment before accepting commands" {
@@ -600,23 +863,23 @@ test "live startup recovers existing journal segment before accepting commands" 
         &.{buy(1, 100, 10)},
     );
 
-    var recovered_book = engine.OrderBook.init();
+    var recovered_books = BookSet.init();
     var recovered_output_buffer: [1024]u8 = undefined;
     var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
     var stdin = std.Io.Reader.fixed("SELL 2 100 4\n");
-    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+    try runLive(io, &stdin, &recovered_writer, &recovered_books, journal_dir);
 
-    var expected_book = engine.OrderBook.init();
+    var expected_books = BookSet.init();
     var expected_output_buffer: [1024]u8 = undefined;
     var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
     try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
-    try applyCommandEvent(&expected_writer, &expected_book, buy(1, 100, 10));
+    try applyCommandEvent(&expected_writer, &expected_books, buy(1, 100, 10));
     expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
-    try applyCommandEvent(&expected_writer, &expected_book, sell(2, 100, 4));
-    try printState(&expected_writer, &expected_book);
+    try applyCommandEvent(&expected_writer, &expected_books, sell(2, 100, 4));
+    try printState(&expected_writer, &expected_books);
 
     try expectOutput(&recovered_writer, expected_writer.buffered());
-    try expectBooksEqual(&expected_book, &recovered_book);
+    try expectBooksEqual(&expected_books, &recovered_books);
 
     var count: usize = 0;
     var it = tmp.dir.iterate();
@@ -642,24 +905,24 @@ test "live startup recovers existing journal segments in segment number order wh
         &.{cancel(1)},
     );
 
-    var recovered_book = engine.OrderBook.init();
+    var recovered_books = BookSet.init();
     var recovered_output_buffer: [1024]u8 = undefined;
     var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
     var stdin = std.Io.Reader.fixed("SELL 2 100 1\n");
-    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+    try runLive(io, &stdin, &recovered_writer, &recovered_books, journal_dir);
 
-    var expected_book = engine.OrderBook.init();
+    var expected_books = BookSet.init();
     var expected_output_buffer: [1024]u8 = undefined;
     var expected_writer = std.Io.Writer.fixed(&expected_output_buffer);
     try expected_writer.writeAll("commands: BUY id price quantity | SELL id price quantity | CANCEL id\n");
-    try applyCommandEvent(&expected_writer, &expected_book, buy(1, 100, 10));
-    try applyCommandEvent(&expected_writer, &expected_book, cancel(1));
+    try applyCommandEvent(&expected_writer, &expected_books, buy(1, 100, 10));
+    try applyCommandEvent(&expected_writer, &expected_books, cancel(1));
     expected_writer.end = "commands: BUY id price quantity | SELL id price quantity | CANCEL id\n".len;
-    try applyCommandEvent(&expected_writer, &expected_book, sell(2, 100, 1));
-    try printState(&expected_writer, &expected_book);
+    try applyCommandEvent(&expected_writer, &expected_books, sell(2, 100, 1));
+    try printState(&expected_writer, &expected_books);
 
     try expectOutput(&recovered_writer, expected_writer.buffered());
-    try expectBooksEqual(&expected_book, &recovered_book);
+    try expectBooksEqual(&expected_books, &recovered_books);
 }
 
 test "live startup creates the next segment number after recovery without reusing a gap" {
@@ -680,11 +943,11 @@ test "live startup creates the next segment number after recovery without reusin
         &.{cancel(1)},
     );
 
-    var recovered_book = engine.OrderBook.init();
+    var recovered_books = BookSet.init();
     var output_buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
     var stdin = std.Io.Reader.fixed("");
-    try runLive(io, &stdin, &writer, &recovered_book, journal_dir);
+    try runLive(io, &stdin, &writer, &recovered_books, journal_dir);
 
     var found_1 = false;
     var found_2 = false;
@@ -723,11 +986,11 @@ test "live startup enforces the fixed recovery segment limit boundary" {
         try writeEmptyJournalSegmentNumber(tmp.dir, number);
     }
 
-    var book = engine.OrderBook.init();
+    var books = BookSet.init();
     var output_buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
     var stdin = std.Io.Reader.fixed("");
-    try runLive(io, &stdin, &writer, &book, journal_dir);
+    try runLive(io, &stdin, &writer, &books, journal_dir);
 
     var bad_tmp = std.testing.tmpDir(.{ .iterate = true });
     defer bad_tmp.cleanup();
@@ -738,13 +1001,13 @@ test "live startup enforces the fixed recovery segment limit boundary" {
         try writeEmptyJournalSegmentNumber(bad_tmp.dir, number);
     }
 
-    var bad_book = engine.OrderBook.init();
+    var bad_books = BookSet.init();
     var bad_output_buffer: [1024]u8 = undefined;
     var bad_writer = std.Io.Writer.fixed(&bad_output_buffer);
     var bad_stdin = std.Io.Reader.fixed("");
     try std.testing.expectError(
         error.RecoverySegmentLimitExceeded,
-        runLive(io, &bad_stdin, &bad_writer, &bad_book, bad_journal_dir),
+        runLive(io, &bad_stdin, &bad_writer, &bad_books, bad_journal_dir),
     );
 }
 
@@ -761,11 +1024,12 @@ test "live startup tolerates incomplete final record only in final segment" {
         &.{buy(1, 100, 10)},
     );
 
-    var recovered_book = engine.OrderBook.init();
+    var recovered_books = BookSet.init();
     var recovered_output_buffer: [1024]u8 = undefined;
     var recovered_writer = std.Io.Writer.fixed(&recovered_output_buffer);
     var stdin = std.Io.Reader.fixed("SELL 2 100 4\n");
-    try runLive(io, &stdin, &recovered_writer, &recovered_book, journal_dir);
+    try runLive(io, &stdin, &recovered_writer, &recovered_books, journal_dir);
+    const recovered_book = try recovered_books.bookFor(default_instrument_id);
     try std.testing.expectEqual(@as(usize, 1), recovered_book.bid_count);
     try std.testing.expectEqual(@as(engine.Quantity, 6), recovered_book.bids[0].quantity);
 
@@ -784,13 +1048,13 @@ test "live startup tolerates incomplete final record only in final segment" {
         &.{sell(2, 110, 5)},
     );
 
-    var bad_book = engine.OrderBook.init();
+    var bad_books = BookSet.init();
     var bad_output_buffer: [1024]u8 = undefined;
     var bad_writer = std.Io.Writer.fixed(&bad_output_buffer);
     var bad_stdin = std.Io.Reader.fixed("");
     try std.testing.expectError(
         error.IncompleteJournalRecordBeforeFinalSegment,
-        runLive(io, &bad_stdin, &bad_writer, &bad_book, bad_journal_dir),
+        runLive(io, &bad_stdin, &bad_writer, &bad_books, bad_journal_dir),
     );
 }
 
@@ -807,23 +1071,23 @@ test "live startup rejects corruption in existing complete journal record" {
         &.{buy(1, 100, 10)},
     );
 
-    var book = engine.OrderBook.init();
+    var books = BookSet.init();
     var output_buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
     var stdin = std.Io.Reader.fixed("");
     try std.testing.expectError(
         error.InvalidJournalChecksum,
-        runLive(io, &stdin, &writer, &book, journal_dir),
+        runLive(io, &stdin, &writer, &books, journal_dir),
     );
 }
 
 test "journal submit append failure prevents command application" {
     const FailingJournal = struct {
-        fn appendSubmitLimit(_: *@This(), _: engine.Order) !void {
+        fn appendSubmitLimit(_: *@This(), _: InstrumentId, _: engine.Order) !void {
             return error.JournalWriteFailed;
         }
 
-        fn appendCancel(_: *@This(), _: engine.OrderId) !void {
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
             return error.JournalWriteFailed;
         }
     };
@@ -835,7 +1099,7 @@ test "journal submit append failure prevents command application" {
 
     try std.testing.expectError(
         error.JournalWriteFailed,
-        applyJournaledCommand(&writer, &book, &failing_journal, buy(1, 100, 10)),
+        applyJournaledCommandToSingleBook(&writer, &book, &failing_journal, buy(1, 100, 10)),
     );
 
     try std.testing.expect(!book.containsOrder(1));
@@ -844,11 +1108,11 @@ test "journal submit append failure prevents command application" {
 
 test "journal cancel append failure prevents command application" {
     const FailingJournal = struct {
-        fn appendSubmitLimit(_: *@This(), _: engine.Order) !void {
+        fn appendSubmitLimit(_: *@This(), _: InstrumentId, _: engine.Order) !void {
             return error.JournalWriteFailed;
         }
 
-        fn appendCancel(_: *@This(), _: engine.OrderId) !void {
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
             return error.JournalWriteFailed;
         }
     };
@@ -856,14 +1120,14 @@ test "journal cancel append failure prevents command application" {
     var book = engine.OrderBook.init();
     var output_buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
-    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
+    try applySingleBookCommandEvent(&writer, &book, buy(1, 100, 10));
     const before = book;
     writer.end = 0;
 
     var failing_journal = FailingJournal{};
     try std.testing.expectError(
         error.JournalWriteFailed,
-        applyJournaledCommand(&writer, &book, &failing_journal, cancel(1)),
+        applyJournaledCommandToSingleBook(&writer, &book, &failing_journal, cancel(1)),
     );
 
     try expectBookUnchanged(&before, &book);
@@ -875,9 +1139,9 @@ test "applyCommandEvent reports duplicate ids and leaves book unchanged" {
     var output_buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try applyCommandEvent(&writer, &book, buy(1, 100, 10));
+    try applySingleBookCommandEvent(&writer, &book, buy(1, 100, 10));
     const before = book;
-    try applyCommandEvent(&writer, &book, buy(1, 99, 5));
+    try applySingleBookCommandEvent(&writer, &book, buy(1, 99, 5));
 
     try expectBookUnchanged(&before, &book);
     try expectOutput(&writer, "ERROR DuplicateOrderId 1\n");
@@ -888,9 +1152,9 @@ test "applyCommandEvent reports missing cancels without changing the book" {
     var output_buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try applyCommandEvent(&writer, &book, sell(1, 110, 5));
+    try applySingleBookCommandEvent(&writer, &book, sell(1, 110, 5));
     const before = book;
-    try applyCommandEvent(&writer, &book, cancel(404));
+    try applySingleBookCommandEvent(&writer, &book, cancel(404));
 
     try expectBookUnchanged(&before, &book);
     try expectOutput(&writer, "NOT_FOUND 404\n");
@@ -901,12 +1165,12 @@ test "applyCommandEvent handles partial fills and fully filled orders" {
     var output_buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try applyCommandEvent(&writer, &book, sell(1, 100, 10));
-    try applyCommandEvent(&writer, &book, buy(2, 100, 4));
+    try applySingleBookCommandEvent(&writer, &book, sell(1, 100, 10));
+    try applySingleBookCommandEvent(&writer, &book, buy(2, 100, 4));
     try std.testing.expect(book.containsOrder(1));
     try std.testing.expectEqual(@as(engine.Quantity, 6), book.asks[0].quantity);
 
-    try applyCommandEvent(&writer, &book, buy(3, 100, 6));
+    try applySingleBookCommandEvent(&writer, &book, buy(3, 100, 6));
     try std.testing.expect(!book.containsOrder(1));
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
     try expectOutput(
@@ -936,7 +1200,7 @@ test "a resting order beyond side capacity is rejected without changing the book
 
     try fillSideWithRestingOrders(&writer, &book, .buy, 1);
     const before_bids = book;
-    try applyCommandEvent(&writer, &book, buy(200, 89, 1));
+    try applySingleBookCommandEvent(&writer, &book, buy(200, 89, 1));
     try expectBookUnchanged(&before_bids, &book);
     try expectOutput(&writer, "ERROR BookFull\n");
 
@@ -944,7 +1208,7 @@ test "a resting order beyond side capacity is rejected without changing the book
     book = engine.OrderBook.init();
     try fillSideWithRestingOrders(&writer, &book, .sell, 1);
     const before_asks = book;
-    try applyCommandEvent(&writer, &book, sell(200, 111, 1));
+    try applySingleBookCommandEvent(&writer, &book, sell(200, 111, 1));
     try expectBookUnchanged(&before_asks, &book);
     try expectOutput(&writer, "ERROR BookFull\n");
 }
@@ -955,8 +1219,8 @@ test "full own side accepts an incoming order that fully crosses" {
     var writer = std.Io.Writer.fixed(&output_buffer);
 
     try fillSideWithRestingOrders(&writer, &book, .buy, 1);
-    try applyCommandEvent(&writer, &book, sell(200, 100, 1));
-    try applyCommandEvent(&writer, &book, buy(201, 100, 1));
+    try applySingleBookCommandEvent(&writer, &book, sell(200, 100, 1));
+    try applySingleBookCommandEvent(&writer, &book, buy(201, 100, 1));
 
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expectEqual(@as(usize, 0), book.ask_count);
@@ -969,9 +1233,9 @@ test "crossing order with residual is rejected when residual cannot rest" {
     var writer = std.Io.Writer.fixed(&output_buffer);
 
     try fillSideWithRestingOrders(&writer, &book, .buy, 1);
-    try applyCommandEvent(&writer, &book, sell(200, 100, 1));
+    try applySingleBookCommandEvent(&writer, &book, sell(200, 100, 1));
     const before = book;
-    try applyCommandEvent(&writer, &book, buy(201, 100, 2));
+    try applySingleBookCommandEvent(&writer, &book, buy(201, 100, 2));
 
     try expectBookUnchanged(&before, &book);
     try expectOutput(&writer, "ERROR BookFull\n");
@@ -983,8 +1247,8 @@ test "canceling a resting order frees capacity for another order" {
     var writer = std.Io.Writer.fixed(&output_buffer);
 
     try fillSideWithRestingOrders(&writer, &book, .buy, 1);
-    try applyCommandEvent(&writer, &book, cancel(1));
-    try applyCommandEvent(&writer, &book, buy(200, 89, 1));
+    try applySingleBookCommandEvent(&writer, &book, cancel(1));
+    try applySingleBookCommandEvent(&writer, &book, buy(200, 89, 1));
 
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expect(!book.containsOrder(1));
@@ -998,8 +1262,8 @@ test "fully filling a resting order frees capacity for another order" {
     var writer = std.Io.Writer.fixed(&output_buffer);
 
     try fillSideWithRestingOrders(&writer, &book, .buy, 1);
-    try applyCommandEvent(&writer, &book, sell(200, 90, 1));
-    try applyCommandEvent(&writer, &book, buy(201, 89, 1));
+    try applySingleBookCommandEvent(&writer, &book, sell(200, 90, 1));
+    try applySingleBookCommandEvent(&writer, &book, buy(201, 89, 1));
 
     try std.testing.expectEqual(@as(usize, engine.max_orders), book.bid_count);
     try std.testing.expect(!book.containsOrder(1));

@@ -26,9 +26,12 @@ Commands are read from stdin:
 BUY 1 100 10
 SELL 2 99 4
 CANCEL 1
+INSTRUMENT 2 BUY 3 101 7
+INSTRUMENT 2 CANCEL 3
 ```
 
 The program prints trades and the full book state after every command.
+Commands without an `INSTRUMENT id` prefix use instrument `1`.
 
 ## Test
 

@@ -23,7 +23,7 @@ NeonMatch is a small, explicit, deterministic matching-engine project. Its purpo
 
 The original MVP is historical and complete: the project has a deterministic fixed-capacity matching engine, stdin command handling, a direct command-event boundary, fixture-backed replay coverage, and focused tests for order acceptance, cancellation, matching, and capacity edges.
 
-Completed post-MVP increments include process-replayable command journaling and operational startup recovery. Treat broader event logs, audit-oriented storage, snapshots, retention, and performance work as later post-MVP work.
+Completed post-MVP increments include process-replayable command journaling, operational startup recovery, a preserved performance and allocation baseline, and fixed multi-instrument routing. Treat broader event logs, audit-oriented storage, snapshots, retention, and performance work as later post-MVP work.
 
 ## Journaling Guidance
 
@@ -250,8 +250,8 @@ Future post-MVP scope may include:
 4. Complete: add deterministic fixtures and direct `CommandEvent` replay for representative matching and cancellation scenarios.
 5. Complete: add append-only process-replayable command journaling and deterministic replay from journal records.
 6. Complete: turn journal replay into operational startup recovery, so process-replayable storage is the normal startup path before live commands are accepted.
-7. Post-MVP: measure the simple single-book engine and verify allocation behavior before expanding its architecture, so future changes have a truthful baseline.
-8. Post-MVP: introduce routing and multiple books for multiple instruments after the recovery path and baseline are established.
+7. Complete: measure the simple single-book engine and verify allocation behavior before expanding its architecture, so future changes have a truthful baseline.
+8. Complete: introduce fixed routing and multiple books for multiple instruments after the recovery path and baseline are established.
 9. Post-MVP: introduce optimized structures only when the reference path and performance baseline can validate them.
 
 ## Non-Goals

@@ -9,6 +9,7 @@ const default_latency_sample_size: usize = 64;
 const tsc_overhead_sample_count: usize = 256;
 const default_journal_dir = ".zig-cache/bench-journal";
 const missing_cancel_base: engine.OrderId = 1_000_000_000_000;
+const benchmark_instrument_id: journal.InstrumentId = 1;
 
 const Measurement = enum {
     throughput,
@@ -614,8 +615,8 @@ fn readTscEnd() u64 {
 
 fn appendJournalCommand(segment: *journal.Segment, command: Command) !void {
     switch (command) {
-        .submit_limit => |order| try segment.appendSubmitLimit(order),
-        .cancel => |id| try segment.appendCancel(id),
+        .submit_limit => |order| try segment.appendSubmitLimit(benchmark_instrument_id, order),
+        .cancel => |id| try segment.appendCancel(benchmark_instrument_id, id),
     }
 }
 

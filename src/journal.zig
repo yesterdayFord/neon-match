@@ -2,10 +2,14 @@ const std = @import("std");
 const engine = @import("engine.zig");
 
 const magic = "NMJ1";
-const version: u8 = 1;
+const version: u8 = 2;
 const header_len = 14;
-const submit_limit_payload_len = 25;
-const cancel_payload_len = 8;
+const submit_limit_payload_len = 29;
+const cancel_payload_len = 12;
+const legacy_version: u8 = 1;
+const legacy_submit_limit_payload_len = 25;
+const legacy_cancel_payload_len = 8;
+const legacy_default_instrument_id: InstrumentId = 1;
 
 pub const default_dir = "journal";
 pub const max_segment_number: u32 = 999999;
@@ -16,8 +20,20 @@ pub const RecordKind = enum(u8) {
 };
 
 pub const Record = union(RecordKind) {
-    submit_limit: engine.Order,
-    cancel: engine.OrderId,
+    submit_limit: InstrumentedOrder,
+    cancel: InstrumentedCancel,
+};
+
+pub const InstrumentId = u32;
+
+pub const InstrumentedOrder = struct {
+    instrument_id: InstrumentId,
+    order: engine.Order,
+};
+
+pub const InstrumentedCancel = struct {
+    instrument_id: InstrumentId,
+    order_id: engine.OrderId,
 };
 
 pub const Segment = struct {
@@ -76,21 +92,23 @@ pub const Segment = struct {
         return self.path[0..self.path_len];
     }
 
-    pub fn appendSubmitLimit(self: *Segment, order: engine.Order) !void {
+    pub fn appendSubmitLimit(self: *Segment, instrument_id: InstrumentId, order: engine.Order) !void {
         var payload: [submit_limit_payload_len]u8 = undefined;
-        payload[0] = switch (order.side) {
+        std.mem.writeInt(u32, payload[0..4], instrument_id, .little);
+        payload[4] = switch (order.side) {
             .buy => 1,
             .sell => 2,
         };
-        std.mem.writeInt(u64, payload[1..9], order.id, .little);
-        std.mem.writeInt(u64, payload[9..17], order.price, .little);
-        std.mem.writeInt(u64, payload[17..25], order.quantity, .little);
+        std.mem.writeInt(u64, payload[5..13], order.id, .little);
+        std.mem.writeInt(u64, payload[13..21], order.price, .little);
+        std.mem.writeInt(u64, payload[21..29], order.quantity, .little);
         try self.appendRecord(.submit_limit, &payload);
     }
 
-    pub fn appendCancel(self: *Segment, id: engine.OrderId) !void {
+    pub fn appendCancel(self: *Segment, instrument_id: InstrumentId, id: engine.OrderId) !void {
         var payload: [cancel_payload_len]u8 = undefined;
-        std.mem.writeInt(u64, &payload, id, .little);
+        std.mem.writeInt(u32, payload[0..4], instrument_id, .little);
+        std.mem.writeInt(u64, payload[4..12], id, .little);
         try self.appendRecord(.cancel, &payload);
     }
 
@@ -176,7 +194,8 @@ pub const Reader = struct {
         try self.readExact(&header);
 
         if (!std.mem.eql(u8, header[0..4], magic)) return error.InvalidJournalMagic;
-        if (header[4] != version) return error.UnsupportedJournalVersion;
+        const record_version = header[4];
+        if (record_version != version and record_version != legacy_version) return error.UnsupportedJournalVersion;
 
         const kind: RecordKind = switch (header[5]) {
             @backingInt(RecordKind.submit_limit) => .submit_limit,
@@ -185,10 +204,7 @@ pub const Reader = struct {
         };
         const payload_len = std.mem.readInt(u32, header[6..10], .little);
         const checksum = std.mem.readInt(u32, header[10..14], .little);
-        const expected_len: u32 = switch (kind) {
-            .submit_limit => submit_limit_payload_len,
-            .cancel => cancel_payload_len,
-        };
+        const expected_len: u32 = expectedPayloadLen(record_version, kind);
         if (payload_len != expected_len) return error.InvalidJournalRecordLength;
 
         if (self.size - self.offset < payload_len) {
@@ -202,8 +218,8 @@ pub const Reader = struct {
         if (std.hash.Crc32.hash(payload_slice) != checksum) return error.InvalidJournalChecksum;
 
         return switch (kind) {
-            .submit_limit => .{ .submit_limit = try decodeSubmitLimit(payload_slice) },
-            .cancel => .{ .cancel = std.mem.readInt(u64, payload_slice[0..8], .little) },
+            .submit_limit => .{ .submit_limit = try decodeSubmitLimit(record_version, payload_slice) },
+            .cancel => .{ .cancel = decodeCancel(record_version, payload_slice) },
         };
     }
 
@@ -218,16 +234,63 @@ pub const Reader = struct {
     }
 };
 
-fn decodeSubmitLimit(payload: []const u8) !engine.Order {
+fn expectedPayloadLen(record_version: u8, kind: RecordKind) u32 {
+    if (record_version == legacy_version) {
+        return switch (kind) {
+            .submit_limit => legacy_submit_limit_payload_len,
+            .cancel => legacy_cancel_payload_len,
+        };
+    }
+
+    return switch (kind) {
+        .submit_limit => submit_limit_payload_len,
+        .cancel => cancel_payload_len,
+    };
+}
+
+fn decodeSubmitLimit(record_version: u8, payload: []const u8) !InstrumentedOrder {
+    if (record_version == legacy_version) {
+        return .{
+            .instrument_id = legacy_default_instrument_id,
+            .order = .{
+                .side = switch (payload[0]) {
+                    1 => .buy,
+                    2 => .sell,
+                    else => return error.InvalidJournalSide,
+                },
+                .id = std.mem.readInt(u64, payload[1..9], .little),
+                .price = std.mem.readInt(u64, payload[9..17], .little),
+                .quantity = std.mem.readInt(u64, payload[17..25], .little),
+            },
+        };
+    }
+
     return .{
-        .side = switch (payload[0]) {
-            1 => .buy,
-            2 => .sell,
-            else => return error.InvalidJournalSide,
+        .instrument_id = std.mem.readInt(u32, payload[0..4], .little),
+        .order = .{
+            .side = switch (payload[4]) {
+                1 => .buy,
+                2 => .sell,
+                else => return error.InvalidJournalSide,
+            },
+            .id = std.mem.readInt(u64, payload[5..13], .little),
+            .price = std.mem.readInt(u64, payload[13..21], .little),
+            .quantity = std.mem.readInt(u64, payload[21..29], .little),
         },
-        .id = std.mem.readInt(u64, payload[1..9], .little),
-        .price = std.mem.readInt(u64, payload[9..17], .little),
-        .quantity = std.mem.readInt(u64, payload[17..25], .little),
+    };
+}
+
+fn decodeCancel(record_version: u8, payload: []const u8) InstrumentedCancel {
+    if (record_version == legacy_version) {
+        return .{
+            .instrument_id = legacy_default_instrument_id,
+            .order_id = std.mem.readInt(u64, payload[0..8], .little),
+        };
+    }
+
+    return .{
+        .instrument_id = std.mem.readInt(u32, payload[0..4], .little),
+        .order_id = std.mem.readInt(u64, payload[4..12], .little),
     };
 }
 
@@ -270,8 +333,8 @@ test "segment appends command records in a temporary directory" {
     const path = segment.segmentPath();
     try std.testing.expect(std.mem.endsWith(u8, path, ".nmj"));
     try std.testing.expect(std.mem.startsWith(u8, path, journal_dir));
-    try segment.appendSubmitLimit(.{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
-    try segment.appendCancel(1);
+    try segment.appendSubmitLimit(1, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+    try segment.appendCancel(1, 1);
     segment.close();
 
     var it = tmp.dir.iterate();
@@ -310,19 +373,48 @@ test "reader decodes valid command records" {
     var segment = try Segment.open(io, journal_dir);
     const path_buffer = segment.path;
     const path_len = segment.path_len;
-    try segment.appendSubmitLimit(.{ .id = 7, .side = .sell, .price = 101, .quantity = 3 });
-    try segment.appendCancel(7);
+    try segment.appendSubmitLimit(2, .{ .id = 7, .side = .sell, .price = 101, .quantity = 3 });
+    try segment.appendCancel(2, 7);
     segment.close();
 
     var reader = try Reader.open(io, path_buffer[0..path_len]);
     defer reader.close();
 
     const first = (try reader.next()).?.submit_limit;
-    try std.testing.expectEqual(engine.Side.sell, first.side);
-    try std.testing.expectEqual(@as(engine.OrderId, 7), first.id);
-    try std.testing.expectEqual(@as(engine.Price, 101), first.price);
-    try std.testing.expectEqual(@as(engine.Quantity, 3), first.quantity);
-    try std.testing.expectEqual(@as(engine.OrderId, 7), (try reader.next()).?.cancel);
+    try std.testing.expectEqual(@as(InstrumentId, 2), first.instrument_id);
+    try std.testing.expectEqual(engine.Side.sell, first.order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 7), first.order.id);
+    try std.testing.expectEqual(@as(engine.Price, 101), first.order.price);
+    try std.testing.expectEqual(@as(engine.Quantity, 3), first.order.quantity);
+    const cancel_record = (try reader.next()).?.cancel;
+    try std.testing.expectEqual(@as(InstrumentId, 2), cancel_record.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 7), cancel_record.order_id);
+    try std.testing.expect((try reader.next()) == null);
+}
+
+test "reader maps legacy records to the default instrument" {
+    var bytes: [legacy_header_and_submit_len + legacy_header_and_cancel_len]u8 = undefined;
+    encodeLegacySubmitLimitRecord(bytes[0..legacy_header_and_submit_len], .{ .id = 7, .side = .sell, .price = 101, .quantity = 3 });
+    encodeLegacyCancelRecord(bytes[legacy_header_and_submit_len..], 7);
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "legacy.nmj", .data = &bytes });
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/legacy.nmj", .{tmp.sub_path[0..]});
+    var reader = try Reader.open(io, path);
+    defer reader.close();
+
+    const first = (try reader.next()).?.submit_limit;
+    try std.testing.expectEqual(legacy_default_instrument_id, first.instrument_id);
+    try std.testing.expectEqual(engine.Side.sell, first.order.side);
+    try std.testing.expectEqual(@as(engine.OrderId, 7), first.order.id);
+
+    const second = (try reader.next()).?.cancel;
+    try std.testing.expectEqual(legacy_default_instrument_id, second.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 7), second.order_id);
     try std.testing.expect((try reader.next()) == null);
 }
 
@@ -339,7 +431,9 @@ test "reader treats only an incomplete final record as a recoverable tail" {
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/tail.nmj", .{tmp.sub_path[0..]});
     var reader = try Reader.open(io, path);
     defer reader.close();
-    try std.testing.expectEqual(@as(engine.OrderId, 9), (try reader.next()).?.cancel);
+    const cancel_record = (try reader.next()).?.cancel;
+    try std.testing.expectEqual(@as(InstrumentId, 1), cancel_record.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 9), cancel_record.order_id);
     try std.testing.expect((try reader.next()) == null);
 }
 
@@ -361,7 +455,9 @@ test "reader treats an incomplete final payload as a recoverable tail" {
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/tail-payload.nmj", .{tmp.sub_path[0..]});
     var reader = try Reader.open(io, path);
     defer reader.close();
-    try std.testing.expectEqual(@as(engine.OrderId, 9), (try reader.next()).?.cancel);
+    const cancel_record = (try reader.next()).?.cancel;
+    try std.testing.expectEqual(@as(InstrumentId, 1), cancel_record.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 9), cancel_record.order_id);
     try std.testing.expect((try reader.next()) == null);
 }
 
@@ -407,7 +503,7 @@ test "reader validates magic version kind expected length checksum and side" {
     try expectReaderError(&bytes, error.InvalidJournalChecksum);
 
     encodeSubmitLimitRecord(&bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
-    bytes[header_len] = 99;
+    bytes[header_len + 4] = 99;
     std.mem.writeInt(u32, bytes[10..14], std.hash.Crc32.hash(bytes[header_len..]), .little);
     try expectReaderError(&bytes, error.InvalidJournalSide);
 }
@@ -418,7 +514,8 @@ fn encodeCancelRecord(buffer: []u8, id: engine.OrderId) void {
     buffer[4] = version;
     buffer[5] = @backingInt(RecordKind.cancel);
     std.mem.writeInt(u32, buffer[6..10], cancel_payload_len, .little);
-    std.mem.writeInt(u64, buffer[header_len .. header_len + cancel_payload_len], id, .little);
+    std.mem.writeInt(u32, buffer[header_len .. header_len + 4], 1, .little);
+    std.mem.writeInt(u64, buffer[header_len + 4 .. header_len + cancel_payload_len], id, .little);
     std.mem.writeInt(u32, buffer[10..14], std.hash.Crc32.hash(buffer[header_len .. header_len + cancel_payload_len]), .little);
 }
 
@@ -428,6 +525,36 @@ fn encodeSubmitLimitRecord(buffer: []u8, order: engine.Order) void {
     buffer[4] = version;
     buffer[5] = @backingInt(RecordKind.submit_limit);
     std.mem.writeInt(u32, buffer[6..10], submit_limit_payload_len, .little);
+    std.mem.writeInt(u32, buffer[header_len .. header_len + 4], 1, .little);
+    buffer[header_len + 4] = switch (order.side) {
+        .buy => 1,
+        .sell => 2,
+    };
+    std.mem.writeInt(u64, buffer[header_len + 5 .. header_len + 13], order.id, .little);
+    std.mem.writeInt(u64, buffer[header_len + 13 .. header_len + 21], order.price, .little);
+    std.mem.writeInt(u64, buffer[header_len + 21 .. header_len + 29], order.quantity, .little);
+    std.mem.writeInt(u32, buffer[10..14], std.hash.Crc32.hash(buffer[header_len..]), .little);
+}
+
+const legacy_header_and_submit_len = header_len + legacy_submit_limit_payload_len;
+const legacy_header_and_cancel_len = header_len + legacy_cancel_payload_len;
+
+fn encodeLegacyCancelRecord(buffer: []u8, id: engine.OrderId) void {
+    std.debug.assert(buffer.len == legacy_header_and_cancel_len);
+    @memcpy(buffer[0..4], magic);
+    buffer[4] = legacy_version;
+    buffer[5] = @backingInt(RecordKind.cancel);
+    std.mem.writeInt(u32, buffer[6..10], legacy_cancel_payload_len, .little);
+    std.mem.writeInt(u64, buffer[header_len .. header_len + legacy_cancel_payload_len], id, .little);
+    std.mem.writeInt(u32, buffer[10..14], std.hash.Crc32.hash(buffer[header_len .. header_len + legacy_cancel_payload_len]), .little);
+}
+
+fn encodeLegacySubmitLimitRecord(buffer: []u8, order: engine.Order) void {
+    std.debug.assert(buffer.len == legacy_header_and_submit_len);
+    @memcpy(buffer[0..4], magic);
+    buffer[4] = legacy_version;
+    buffer[5] = @backingInt(RecordKind.submit_limit);
+    std.mem.writeInt(u32, buffer[6..10], legacy_submit_limit_payload_len, .little);
     buffer[header_len] = switch (order.side) {
         .buy => 1,
         .sell => 2,
