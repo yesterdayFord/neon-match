@@ -25,6 +25,12 @@ The original MVP is historical and complete: the project has a deterministic fix
 
 Completed post-MVP increments include process-replayable command journaling, operational startup recovery, a preserved performance and allocation baseline, and fixed multi-instrument routing. Treat broader event logs, audit-oriented storage, snapshots, retention, and performance work as later post-MVP work.
 
+## Roadmap Authority
+
+High-level product direction and bounded project phases live in [ROADMAP.md](ROADMAP.md).
+
+This brief documents the current project architecture, principles, scope, and durable engineering decisions. Detailed implementation work belongs in GitHub issues, pull requests, tests, and code rather than in a second roadmap here.
+
 ## Journaling Guidance
 
 The journal preserves the ordered input truth of the engine.
@@ -245,21 +251,9 @@ Future post-MVP scope may include:
 - Event logs, replay, and audit-oriented fixtures.
 - A command-line simulation or inspection tool.
 
-## Roadmap
-
-1. Complete: establish the project scaffold, brief, local guidance, build file, and executable entry point.
-2. Complete: define the core domain vocabulary: side, price, quantity, order id, order, trade, and book state.
-3. Complete: implement a simple reference matcher with focused unit tests.
-4. Complete: add deterministic fixtures and direct `CommandEvent` replay for representative matching and cancellation scenarios.
-5. Complete: add append-only process-replayable command journaling and deterministic replay from journal records.
-6. Complete: turn journal replay into operational startup recovery, so process-replayable storage is the normal startup path before live commands are accepted.
-7. Complete: measure the simple single-book engine and verify allocation behavior before expanding its architecture, so future changes have a truthful baseline.
-8. Complete: introduce fixed routing and multiple books for multiple instruments after the recovery path and baseline are established.
-9. Post-MVP: introduce optimized structures only when the reference path and performance baseline can validate them.
-
 ## Non-Goals
 
-- Do not build an exchange, broker, trading bot, or production market gateway.
+- Do not build an exchange, broker, trading bot, or production market gateway during the original reference-matcher scope.
 - Do not optimize before the matching rules are stable and tested.
 - Do not add networking, persistence, authentication, or UI concerns during the initial scaffold phase.
 - Do not make the project depend on shared engineering guidance at runtime or through symlinks.
