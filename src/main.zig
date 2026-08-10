@@ -513,6 +513,10 @@ fn expectOutput(writer: *const std.Io.Writer, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, writer.buffered());
 }
 
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
 fn expectBookUnchanged(before: *const engine.OrderBook, after: *const engine.OrderBook) !void {
     try std.testing.expectEqual(before.bid_count, after.bid_count);
     try std.testing.expectEqual(before.ask_count, after.ask_count);
@@ -683,6 +687,33 @@ fn encodeJournalRecord(writer: *std.Io.Writer, kind: u8, payload: []const u8) !v
     try writer.writeAll(payload);
 }
 
+fn encodeRawSubmitLimitRecord(
+    writer: *std.Io.Writer,
+    instrument_id: InstrumentId,
+    side: engine.Side,
+    id: engine.OrderId,
+    price: engine.Price,
+    quantity: engine.Quantity,
+) !void {
+    var payload: [29]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], instrument_id, .little);
+    payload[4] = switch (side) {
+        .buy => 1,
+        .sell => 2,
+    };
+    std.mem.writeInt(u64, payload[5..13], id, .little);
+    std.mem.writeInt(u64, payload[13..21], price, .little);
+    std.mem.writeInt(u64, payload[21..29], quantity, .little);
+    try encodeJournalRecord(writer, 1, &payload);
+}
+
+fn encodeRawCancelRecord(writer: *std.Io.Writer, instrument_id: InstrumentId, id: engine.OrderId) !void {
+    var payload: [12]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], instrument_id, .little);
+    std.mem.writeInt(u64, payload[4..12], id, .little);
+    try encodeJournalRecord(writer, 2, &payload);
+}
+
 const generated_history_max = 240;
 
 const GeneratedHistory = struct {
@@ -830,6 +861,107 @@ test "parse explicit instrument prefix into routed command events" {
 
     try std.testing.expectError(error.UnknownInstrument, parseCommandEvent("INSTRUMENT 0 BUY 1 100 10"));
     try std.testing.expectError(error.UnknownInstrument, parseCommandEvent("INSTRUMENT 5 BUY 1 100 10"));
+}
+
+test "malformed command parser errors are explicit" {
+    const Case = struct {
+        line: []const u8,
+        expected: anyerror,
+    };
+    const cases = [_]Case{
+        .{ .line = "", .expected = error.EmptyCommand },
+        .{ .line = "   \t", .expected = error.EmptyCommand },
+        .{ .line = "BUY", .expected = error.MissingOrderId },
+        .{ .line = "BUY 1", .expected = error.MissingPrice },
+        .{ .line = "BUY 1 100", .expected = error.MissingQuantity },
+        .{ .line = "BUY 1 100 10 extra", .expected = error.TooManyFields },
+        .{ .line = "SELL 1 100 10 extra", .expected = error.TooManyFields },
+        .{ .line = "CANCEL", .expected = error.MissingOrderId },
+        .{ .line = "CANCEL 1 extra", .expected = error.TooManyFields },
+        .{ .line = "BOGUS 1 100 10", .expected = error.UnknownCommand },
+        .{ .line = "BUY abc 100 1", .expected = error.InvalidCharacter },
+        .{ .line = "BUY 0 100 1", .expected = error.MustBePositive },
+        .{ .line = "BUY -1 100 1", .expected = error.Overflow },
+        .{ .line = "BUY 18446744073709551616 100 1", .expected = error.Overflow },
+        .{ .line = "BUY 1 abc 1", .expected = error.InvalidCharacter },
+        .{ .line = "BUY 1 0 1", .expected = error.MustBePositive },
+        .{ .line = "BUY 1 100 abc", .expected = error.InvalidCharacter },
+        .{ .line = "BUY 1 100 0", .expected = error.MustBePositive },
+        .{ .line = "INSTRUMENT", .expected = error.MissingInstrumentId },
+        .{ .line = "INSTRUMENT 2", .expected = error.MissingCommand },
+        .{ .line = "INSTRUMENT 0 BUY 1 100 1", .expected = error.UnknownInstrument },
+        .{ .line = "INSTRUMENT 5 BUY 1 100 1", .expected = error.UnknownInstrument },
+        .{ .line = "INSTRUMENT -1 BUY 1 100 1", .expected = error.Overflow },
+        .{ .line = "INSTRUMENT 4294967296 BUY 1 100 1", .expected = error.Overflow },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, parseCommandEvent(case.line));
+    }
+}
+
+test "malformed live input is not journaled and later valid commands continue" {
+    const io = std.testing.io;
+    const Case = struct {
+        line: []const u8,
+        expected_error: ?[]const u8,
+    };
+    const cases = [_]Case{
+        .{ .line = "", .expected_error = null },
+        .{ .line = "   \t", .expected_error = null },
+        .{ .line = "BUY", .expected_error = "ERROR MissingOrderId\n" },
+        .{ .line = "BUY 1", .expected_error = "ERROR MissingPrice\n" },
+        .{ .line = "BUY 1 100", .expected_error = "ERROR MissingQuantity\n" },
+        .{ .line = "BUY 1 100 10 extra", .expected_error = "ERROR TooManyFields\n" },
+        .{ .line = "SELL 1 100 10 extra", .expected_error = "ERROR TooManyFields\n" },
+        .{ .line = "CANCEL", .expected_error = "ERROR MissingOrderId\n" },
+        .{ .line = "CANCEL 1 extra", .expected_error = "ERROR TooManyFields\n" },
+        .{ .line = "BOGUS 1 100 10", .expected_error = "ERROR UnknownCommand\n" },
+        .{ .line = "BUY abc 100 1", .expected_error = "ERROR InvalidCharacter\n" },
+        .{ .line = "BUY 0 100 1", .expected_error = "ERROR MustBePositive\n" },
+        .{ .line = "BUY -1 100 1", .expected_error = "ERROR Overflow\n" },
+        .{ .line = "BUY 18446744073709551616 100 1", .expected_error = "ERROR Overflow\n" },
+        .{ .line = "BUY 1 0 1", .expected_error = "ERROR MustBePositive\n" },
+        .{ .line = "BUY 1 100 0", .expected_error = "ERROR MustBePositive\n" },
+        .{ .line = "INSTRUMENT 0 BUY 1 100 1", .expected_error = "ERROR UnknownInstrument\n" },
+        .{ .line = "INSTRUMENT 5 BUY 1 100 1", .expected_error = "ERROR UnknownInstrument\n" },
+        .{ .line = "INSTRUMENT -1 BUY 1 100 1", .expected_error = "ERROR Overflow\n" },
+    };
+
+    for (cases, 0..) |case, index| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+
+        var journal_dir_buffer: [64]u8 = undefined;
+        const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+        var input_buffer: [256]u8 = undefined;
+        const input = try std.fmt.bufPrint(&input_buffer, "{s}\nBUY 900 100 1\n", .{case.line});
+
+        var books = BookSet.init();
+        var output_buffer: [2048]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&output_buffer);
+        var stdin = std.Io.Reader.fixed(input);
+        try runLive(io, &stdin, &writer, &books, journal_dir);
+
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer) catch |err| {
+            std.debug.print("malformed live case failed index={d} line='{s}'\n", .{ index, case.line });
+            return err;
+        };
+        try std.testing.expectEqual(@as(usize, 1), try journalRecordCount(io, journal_path));
+
+        var expected_books = BookSet.init();
+        var discard_buffer: [128]u8 = undefined;
+        var discard_writer = std.Io.Writer.fixed(&discard_buffer);
+        try applyCommandEvent(&discard_writer, &expected_books, buy(900, 100, 1));
+        try expectBooksEqual(&expected_books, &books);
+
+        if (case.expected_error) |expected_error| {
+            try expectContains(writer.buffered(), expected_error);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ERROR ") == null);
+        }
+    }
 }
 
 test "buy sell and cancel events can be applied without stdin" {
@@ -1406,6 +1538,98 @@ test "live startup rejects corruption in existing complete journal record" {
         error.InvalidJournalChecksum,
         runLive(io, &stdin, &writer, &books, journal_dir),
     );
+}
+
+test "startup recovery stops at corrupted records in first middle and final positions" {
+    const io = std.testing.io;
+    const record_len = 14 + 29;
+
+    for ([_]usize{ 0, 1, 2 }) |bad_index| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+
+        var journal_dir_buffer: [64]u8 = undefined;
+        const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+        var bytes: [record_len * 3]u8 = undefined;
+        var bytes_writer = std.Io.Writer.fixed(&bytes);
+        try encodeRawSubmitLimitRecord(&bytes_writer, 1, .buy, 1, 100, 1);
+        try encodeRawSubmitLimitRecord(&bytes_writer, 2, .buy, 2, 100, 1);
+        try encodeRawSubmitLimitRecord(&bytes_writer, 3, .buy, 3, 100, 1);
+        bytes[bad_index * record_len + 10] ^= 0xff;
+        try tmp.dir.writeFile(io, .{ .sub_path = "journal-20260730T014500Z-000001.nmj", .data = &bytes });
+
+        var books = BookSet.init();
+        try std.testing.expectError(error.InvalidJournalChecksum, recoverJournalDir(io, &books, journal_dir));
+
+        const book_1 = try books.bookFor(1);
+        const book_2 = try books.bookFor(2);
+        const book_3 = try books.bookFor(3);
+        try std.testing.expectEqual(@as(usize, if (bad_index > 0) 1 else 0), book_1.bid_count);
+        try std.testing.expectEqual(@as(usize, if (bad_index > 1) 1 else 0), book_2.bid_count);
+        try std.testing.expectEqual(@as(usize, 0), book_3.bid_count);
+    }
+}
+
+test "startup recovery rejects checksum-valid semantic journal corruption without applying later records" {
+    const io = std.testing.io;
+    const BadPayload = enum {
+        submit_instrument_zero,
+        submit_instrument_too_high,
+        submit_order_id_zero,
+        submit_price_zero,
+        submit_quantity_zero,
+        cancel_instrument_zero,
+        cancel_instrument_too_high,
+        cancel_order_id_zero,
+    };
+    const Case = struct {
+        bad_payload: BadPayload,
+        expected_error: anyerror,
+    };
+    const cases = [_]Case{
+        .{ .bad_payload = .submit_instrument_zero, .expected_error = error.UnknownInstrument },
+        .{ .bad_payload = .submit_instrument_too_high, .expected_error = error.UnknownInstrument },
+        .{ .bad_payload = .submit_order_id_zero, .expected_error = error.InvalidJournalOrderId },
+        .{ .bad_payload = .submit_price_zero, .expected_error = error.InvalidJournalPrice },
+        .{ .bad_payload = .submit_quantity_zero, .expected_error = error.InvalidJournalQuantity },
+        .{ .bad_payload = .cancel_instrument_zero, .expected_error = error.UnknownInstrument },
+        .{ .bad_payload = .cancel_instrument_too_high, .expected_error = error.UnknownInstrument },
+        .{ .bad_payload = .cancel_order_id_zero, .expected_error = error.InvalidJournalOrderId },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+
+        var journal_dir_buffer: [64]u8 = undefined;
+        const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+        var bytes: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&bytes);
+        try encodeRawSubmitLimitRecord(&writer, 1, .buy, 1, 100, 1);
+        switch (case.bad_payload) {
+            .submit_instrument_zero => try encodeRawSubmitLimitRecord(&writer, 0, .buy, 20, 100, 1),
+            .submit_instrument_too_high => try encodeRawSubmitLimitRecord(&writer, max_instruments + 1, .buy, 20, 100, 1),
+            .submit_order_id_zero => try encodeRawSubmitLimitRecord(&writer, 1, .buy, 0, 100, 1),
+            .submit_price_zero => try encodeRawSubmitLimitRecord(&writer, 1, .buy, 20, 0, 1),
+            .submit_quantity_zero => try encodeRawSubmitLimitRecord(&writer, 1, .buy, 20, 100, 0),
+            .cancel_instrument_zero => try encodeRawCancelRecord(&writer, 0, 1),
+            .cancel_instrument_too_high => try encodeRawCancelRecord(&writer, max_instruments + 1, 1),
+            .cancel_order_id_zero => try encodeRawCancelRecord(&writer, 1, 0),
+        }
+        try encodeRawSubmitLimitRecord(&writer, 2, .buy, 2, 100, 1);
+        try tmp.dir.writeFile(io, .{ .sub_path = "journal-20260730T014500Z-000001.nmj", .data = writer.buffered() });
+
+        var books = BookSet.init();
+        try std.testing.expectError(case.expected_error, recoverJournalDir(io, &books, journal_dir));
+
+        const book_1 = try books.bookFor(1);
+        const book_2 = try books.bookFor(2);
+        try std.testing.expectEqual(@as(usize, 1), book_1.bid_count);
+        try std.testing.expectEqual(@as(engine.OrderId, 1), book_1.bids[0].id);
+        try std.testing.expectEqual(@as(usize, 0), book_2.bid_count);
+    }
 }
 
 test "journal submit append failure prevents command application" {

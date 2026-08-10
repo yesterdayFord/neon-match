@@ -219,7 +219,7 @@ pub const Reader = struct {
 
         return switch (kind) {
             .submit_limit => .{ .submit_limit = try decodeSubmitLimit(record_version, payload_slice) },
-            .cancel => .{ .cancel = decodeCancel(record_version, payload_slice) },
+            .cancel => .{ .cancel = try decodeCancel(record_version, payload_slice) },
         };
     }
 
@@ -250,6 +250,9 @@ fn expectedPayloadLen(record_version: u8, kind: RecordKind) u32 {
 
 fn decodeSubmitLimit(record_version: u8, payload: []const u8) !InstrumentedOrder {
     if (record_version == legacy_version) {
+        const id = std.mem.readInt(u64, payload[1..9], .little);
+        const price = std.mem.readInt(u64, payload[9..17], .little);
+        const quantity = std.mem.readInt(u64, payload[17..25], .little);
         return .{
             .instrument_id = legacy_default_instrument_id,
             .order = .{
@@ -258,13 +261,16 @@ fn decodeSubmitLimit(record_version: u8, payload: []const u8) !InstrumentedOrder
                     2 => .sell,
                     else => return error.InvalidJournalSide,
                 },
-                .id = std.mem.readInt(u64, payload[1..9], .little),
-                .price = std.mem.readInt(u64, payload[9..17], .little),
-                .quantity = std.mem.readInt(u64, payload[17..25], .little),
+                .id = try validateJournalOrderId(id),
+                .price = try validateJournalPrice(price),
+                .quantity = try validateJournalQuantity(quantity),
             },
         };
     }
 
+    const id = std.mem.readInt(u64, payload[5..13], .little);
+    const price = std.mem.readInt(u64, payload[13..21], .little);
+    const quantity = std.mem.readInt(u64, payload[21..29], .little);
     return .{
         .instrument_id = std.mem.readInt(u32, payload[0..4], .little),
         .order = .{
@@ -273,25 +279,40 @@ fn decodeSubmitLimit(record_version: u8, payload: []const u8) !InstrumentedOrder
                 2 => .sell,
                 else => return error.InvalidJournalSide,
             },
-            .id = std.mem.readInt(u64, payload[5..13], .little),
-            .price = std.mem.readInt(u64, payload[13..21], .little),
-            .quantity = std.mem.readInt(u64, payload[21..29], .little),
+            .id = try validateJournalOrderId(id),
+            .price = try validateJournalPrice(price),
+            .quantity = try validateJournalQuantity(quantity),
         },
     };
 }
 
-fn decodeCancel(record_version: u8, payload: []const u8) InstrumentedCancel {
+fn decodeCancel(record_version: u8, payload: []const u8) !InstrumentedCancel {
     if (record_version == legacy_version) {
         return .{
             .instrument_id = legacy_default_instrument_id,
-            .order_id = std.mem.readInt(u64, payload[0..8], .little),
+            .order_id = try validateJournalOrderId(std.mem.readInt(u64, payload[0..8], .little)),
         };
     }
 
     return .{
         .instrument_id = std.mem.readInt(u32, payload[0..4], .little),
-        .order_id = std.mem.readInt(u64, payload[4..12], .little),
+        .order_id = try validateJournalOrderId(std.mem.readInt(u64, payload[4..12], .little)),
     };
+}
+
+fn validateJournalOrderId(id: engine.OrderId) !engine.OrderId {
+    if (id == 0) return error.InvalidJournalOrderId;
+    return id;
+}
+
+fn validateJournalPrice(price: engine.Price) !engine.Price {
+    if (price == 0) return error.InvalidJournalPrice;
+    return price;
+}
+
+fn validateJournalQuantity(quantity: engine.Quantity) !engine.Quantity {
+    if (quantity == 0) return error.InvalidJournalQuantity;
+    return quantity;
 }
 
 fn formatUtcTimestamp(buffer: *[16]u8, timestamp: std.Io.Timestamp) []const u8 {
@@ -508,6 +529,47 @@ test "reader validates magic version kind expected length checksum and side" {
     try expectReaderError(&bytes, error.InvalidJournalSide);
 }
 
+test "reader rejects checksum-valid semantic payload corruption" {
+    var submit_bytes: [header_len + submit_limit_payload_len]u8 = undefined;
+    encodeSubmitLimitRecord(&submit_bytes, .{ .id = 0, .side = .buy, .price = 100, .quantity = 10 });
+    try expectReaderError(&submit_bytes, error.InvalidJournalOrderId);
+
+    encodeSubmitLimitRecord(&submit_bytes, .{ .id = 1, .side = .buy, .price = 0, .quantity = 10 });
+    try expectReaderError(&submit_bytes, error.InvalidJournalPrice);
+
+    encodeSubmitLimitRecord(&submit_bytes, .{ .id = 1, .side = .buy, .price = 100, .quantity = 0 });
+    try expectReaderError(&submit_bytes, error.InvalidJournalQuantity);
+
+    var cancel_bytes: [header_len + cancel_payload_len]u8 = undefined;
+    encodeCancelRecord(&cancel_bytes, 0);
+    try expectReaderError(&cancel_bytes, error.InvalidJournalOrderId);
+
+    var legacy_submit_bytes: [legacy_header_and_submit_len]u8 = undefined;
+    encodeLegacySubmitLimitRecord(&legacy_submit_bytes, .{ .id = 1, .side = .sell, .price = 101, .quantity = 0 });
+    try expectReaderError(&legacy_submit_bytes, error.InvalidJournalQuantity);
+
+    var legacy_cancel_bytes: [legacy_header_and_cancel_len]u8 = undefined;
+    encodeLegacyCancelRecord(&legacy_cancel_bytes, 0);
+    try expectReaderError(&legacy_cancel_bytes, error.InvalidJournalOrderId);
+}
+
+test "reader treats truncated headers and payloads as recoverable final tails" {
+    var full_record: [header_len + submit_limit_payload_len]u8 = undefined;
+    encodeSubmitLimitRecord(&full_record, .{ .id = 1, .side = .buy, .price = 100, .quantity = 10 });
+
+    const truncations = [_]usize{
+        1,
+        header_len - 1,
+        header_len,
+        header_len + 1,
+        full_record.len - 1,
+    };
+
+    inline for (truncations) |len| {
+        try expectReaderTail(full_record[0..len]);
+    }
+}
+
 fn encodeCancelRecord(buffer: []u8, id: engine.OrderId) void {
     std.debug.assert(buffer.len == header_len + cancel_payload_len);
     @memcpy(buffer[0..4], magic);
@@ -577,4 +639,19 @@ fn expectReaderError(data: []const u8, expected: anyerror) !void {
     defer reader.close();
 
     try std.testing.expectError(expected, reader.next());
+}
+
+fn expectReaderTail(data: []const u8) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.nmj", .data = data });
+    var path_buffer: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/tail.nmj", .{tmp.sub_path[0..]});
+    var reader = try Reader.open(io, path);
+    defer reader.close();
+
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expect(reader.recoveredTail());
 }
