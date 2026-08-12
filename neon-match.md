@@ -41,6 +41,16 @@ FIX fields must not leak deeply into the matcher. Execution responses, market da
 
 The CLI remains the reference/debug client. A GUI client belongs only where it helps humans understand, exercise, or operate the exchange without bypassing the same authoritative boundaries.
 
+First FIX profile decisions:
+
+- Support one deliberately small FIX 4.4 profile before adding market data or multiple protocol versions.
+- Map `Symbol` values `NM1` through `NM4` directly to the current fixed instrument ids `1` through `4`.
+- Treat `ClOrdID` as the first-slice external order identifier and require it to parse as the internal numeric order id.
+- Scope `ClOrdID` uniqueness to the FIX session in the first slice.
+- Resolve `OrderCancelRequest` through `OrigClOrdID`.
+- Produce deterministic `ExecID` values from NeonMatch's authoritative command sequence plus per-session execution-report sequence.
+- Keep FIX session sequence state separate from engine journal recovery until reconnect/resend correctness becomes an explicit implementation task.
+
 ## Journaling Guidance
 
 The journal preserves the ordered input truth of the engine.

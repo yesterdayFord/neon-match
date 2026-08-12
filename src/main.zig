@@ -37,6 +37,30 @@ const BookSet = struct {
     }
 };
 
+const CommandResult = union(enum) {
+    submitted: SubmittedResult,
+    canceled: InstrumentedCancel,
+    not_found: InstrumentedCancel,
+    rejected: RejectedCommand,
+};
+
+const SubmittedResult = struct {
+    instrument_id: InstrumentId,
+    order: engine.Order,
+    match_result: engine.MatchResult,
+};
+
+const RejectReason = enum {
+    DuplicateOrderId,
+    BookFull,
+};
+
+const RejectedCommand = struct {
+    instrument_id: InstrumentId,
+    order_id: engine.OrderId,
+    reason: RejectReason,
+};
+
 fn instrumentIndex(instrument_id: InstrumentId) !usize {
     if (instrument_id == 0 or instrument_id > max_instruments) return error.UnknownInstrument;
     return @intCast(instrument_id - 1);
@@ -293,41 +317,70 @@ pub fn applyCommandEvent(
     books: *BookSet,
     event: CommandEvent,
 ) !void {
+    const result = try applyCommandEventStructured(books, event);
+    try printCommandResult(writer, &result);
+}
+
+fn applyCommandEventStructured(
+    books: *BookSet,
+    event: CommandEvent,
+) !CommandResult {
     switch (event) {
         .submit_limit => |instrumented| {
             const book = try books.bookFor(instrumented.instrument_id);
             const order = instrumented.order;
-            if (!try canAccept(writer, instrumented.instrument_id, book, order)) return;
+            if (commandReject(instrumented.instrument_id, book, order)) |rejected| return .{ .rejected = rejected };
             const result = book.submitLimit(order);
-            try printTrades(writer, instrumented.instrument_id, &result);
+            return .{ .submitted = .{
+                .instrument_id = instrumented.instrument_id,
+                .order = order,
+                .match_result = result,
+            } };
         },
         .cancel => |instrumented| {
             const book = try books.bookFor(instrumented.instrument_id);
             const id = instrumented.order_id;
             if (book.cancel(id)) {
-                try writer.print("INSTRUMENT {d} CANCELED {d}\n", .{ instrumented.instrument_id, id });
-            } else {
-                try writer.print("INSTRUMENT {d} NOT_FOUND {d}\n", .{ instrumented.instrument_id, id });
+                return .{ .canceled = instrumented };
             }
+            return .{ .not_found = instrumented };
         },
     }
 }
 
-fn canAccept(
-    writer: *std.Io.Writer,
+fn commandReject(
     instrument_id: InstrumentId,
     book: *const engine.OrderBook,
     order: engine.Order,
-) !bool {
+) ?RejectedCommand {
     if (book.containsOrder(order.id)) {
-        try writer.print("INSTRUMENT {d} ERROR DuplicateOrderId {d}\n", .{ instrument_id, order.id });
-        return false;
+        return .{ .instrument_id = instrument_id, .order_id = order.id, .reason = .DuplicateOrderId };
     }
     if (book.restingQuantityAfterMatch(order) > 0 and !book.hasRoomFor(order.side)) {
-        try writer.print("INSTRUMENT {d} ERROR BookFull\n", .{instrument_id});
-        return false;
+        return .{ .instrument_id = instrument_id, .order_id = order.id, .reason = .BookFull };
     }
-    return true;
+    return null;
+}
+
+fn printCommandResult(writer: *std.Io.Writer, result: *const CommandResult) !void {
+    switch (result.*) {
+        .submitted => |submitted| try printTrades(writer, submitted.instrument_id, &submitted.match_result),
+        .canceled => |instrumented| try writer.print(
+            "INSTRUMENT {d} CANCELED {d}\n",
+            .{ instrumented.instrument_id, instrumented.order_id },
+        ),
+        .not_found => |instrumented| try writer.print(
+            "INSTRUMENT {d} NOT_FOUND {d}\n",
+            .{ instrumented.instrument_id, instrumented.order_id },
+        ),
+        .rejected => |rejected| switch (rejected.reason) {
+            .DuplicateOrderId => try writer.print(
+                "INSTRUMENT {d} ERROR DuplicateOrderId {d}\n",
+                .{ rejected.instrument_id, rejected.order_id },
+            ),
+            .BookFull => try writer.print("INSTRUMENT {d} ERROR BookFull\n", .{rejected.instrument_id}),
+        },
+    }
 }
 
 fn readLine(reader: *std.Io.Reader, buffer: []u8) !?[]const u8 {
@@ -712,6 +765,295 @@ fn encodeRawCancelRecord(writer: *std.Io.Writer, instrument_id: InstrumentId, id
     std.mem.writeInt(u32, payload[0..4], instrument_id, .little);
     std.mem.writeInt(u64, payload[4..12], id, .little);
     try encodeJournalRecord(writer, 2, &payload);
+}
+
+const fix_version = "FIX.4.4";
+const fix_begin_string = "8=FIX.4.4";
+const fix_exchange_id = "NEONMATCH";
+const max_fix_fields = 32;
+const max_fix_clord_mappings = engine.max_orders * max_instruments;
+
+const FixField = struct {
+    tag: u16,
+    value: []const u8,
+};
+
+const FixMessage = struct {
+    fields: [max_fix_fields]FixField = undefined,
+    field_count: usize = 0,
+
+    fn parse(bytes: []const u8) !FixMessage {
+        var message = FixMessage{};
+        var index: usize = 0;
+        while (index < bytes.len) {
+            while (index < bytes.len and isFixDelimiter(bytes[index])) : (index += 1) {}
+            if (index == bytes.len) break;
+
+            const start = index;
+            while (index < bytes.len and !isFixDelimiter(bytes[index])) : (index += 1) {}
+            const field = bytes[start..index];
+            const equals_index = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidFixField;
+            if (equals_index == 0 or equals_index + 1 == field.len) return error.InvalidFixField;
+            if (message.field_count == message.fields.len) return error.TooManyFixFields;
+            message.fields[message.field_count] = .{
+                .tag = try std.fmt.parseInt(u16, field[0..equals_index], 10),
+                .value = field[equals_index + 1 ..],
+            };
+            message.field_count += 1;
+        }
+        if (message.field_count == 0) return error.EmptyFixMessage;
+        return message;
+    }
+
+    fn required(self: *const FixMessage, tag: u16) ![]const u8 {
+        return self.get(tag) orelse error.MissingFixField;
+    }
+
+    fn get(self: *const FixMessage, tag: u16) ?[]const u8 {
+        var index: usize = 0;
+        while (index < self.field_count) : (index += 1) {
+            if (self.fields[index].tag == tag) return self.fields[index].value;
+        }
+        return null;
+    }
+};
+
+fn isFixDelimiter(byte: u8) bool {
+    return byte == 1 or byte == '|' or byte == '\r' or byte == '\n';
+}
+
+const FixClOrdMapping = struct {
+    cl_ord_id: []const u8,
+    instrument_id: InstrumentId,
+    order_id: engine.OrderId,
+};
+
+const FixSession = struct {
+    expected_in_seq: u64 = 1,
+    next_out_seq: u64 = 1,
+    next_authoritative_sequence: u64 = 1,
+    next_exec_id: u64 = 1,
+    logged_on: bool = false,
+    sender: []const u8 = "",
+    target: []const u8 = fix_exchange_id,
+    mappings: [max_fix_clord_mappings]FixClOrdMapping = undefined,
+    mapping_count: usize = 0,
+
+    fn handle(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        books: *BookSet,
+        segment: anytype,
+        bytes: []const u8,
+    ) !void {
+        const message = try self.validateSession(bytes);
+        const msg_type = try message.required(35);
+        if (std.mem.eql(u8, msg_type, "A")) return self.handleLogon(writer);
+        if (std.mem.eql(u8, msg_type, "5")) return self.handleLogout(writer);
+        if (std.mem.eql(u8, msg_type, "0")) return self.handleHeartbeat(writer);
+        if (std.mem.eql(u8, msg_type, "1")) return self.handleTestRequest(writer, &message);
+        if (!self.logged_on) return error.FixSessionNotLoggedOn;
+        if (std.mem.eql(u8, msg_type, "D")) return self.handleNewOrderSingle(writer, books, segment, &message);
+        if (std.mem.eql(u8, msg_type, "F")) return self.handleOrderCancelRequest(writer, books, segment, &message);
+        return error.UnsupportedFixMsgType;
+    }
+
+    fn validateSession(self: *FixSession, bytes: []const u8) !FixMessage {
+        const message = try FixMessage.parse(bytes);
+        if (!std.mem.eql(u8, try message.required(8), fix_version)) return error.UnsupportedFixVersion;
+        const seq = try parsePositive(u64, try message.required(34));
+        if (seq != self.expected_in_seq) return error.InvalidFixMsgSeqNum;
+        const sender = try message.required(49);
+        const target = try message.required(56);
+        if (!std.mem.eql(u8, target, fix_exchange_id)) return error.InvalidFixTargetCompID;
+        if (self.expected_in_seq == 1) {
+            self.sender = sender;
+        } else if (!std.mem.eql(u8, sender, self.sender)) {
+            return error.InvalidFixSenderCompID;
+        }
+        self.expected_in_seq += 1;
+        return message;
+    }
+
+    fn handleLogon(self: *FixSession, writer: *std.Io.Writer) !void {
+        self.logged_on = true;
+        try self.writeSessionMessage(writer, "A", null);
+    }
+
+    fn handleLogout(self: *FixSession, writer: *std.Io.Writer) !void {
+        self.logged_on = false;
+        try self.writeSessionMessage(writer, "5", null);
+    }
+
+    fn handleHeartbeat(self: *FixSession, writer: *std.Io.Writer) !void {
+        try self.writeSessionMessage(writer, "0", null);
+    }
+
+    fn handleTestRequest(self: *FixSession, writer: *std.Io.Writer, message: *const FixMessage) !void {
+        const test_req_id = try message.required(112);
+        try self.writeSessionMessage(writer, "0", .{ .tag = 112, .value = test_req_id });
+    }
+
+    fn handleNewOrderSingle(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        books: *BookSet,
+        segment: anytype,
+        message: *const FixMessage,
+    ) !void {
+        const cl_ord_id = try message.required(11);
+        if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
+        const instrument_id = try symbolToInstrumentId(try message.required(55));
+        const side = try fixSideToEngineSide(try message.required(54));
+        const order_id = try parsePositive(engine.OrderId, cl_ord_id);
+        const order: engine.Order = .{
+            .id = order_id,
+            .side = side,
+            .price = try parsePositive(engine.Price, try message.required(44)),
+            .quantity = try parsePositive(engine.Quantity, try message.required(38)),
+        };
+        const event = CommandEvent{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
+        try self.applyAuthoritative(writer, books, segment, event, cl_ord_id);
+        try self.storeMapping(cl_ord_id, instrument_id, order_id);
+    }
+
+    fn handleOrderCancelRequest(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        books: *BookSet,
+        segment: anytype,
+        message: *const FixMessage,
+    ) !void {
+        const cl_ord_id = try message.required(11);
+        if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
+        const orig_cl_ord_id = try message.required(41);
+        const mapping = self.findMapping(orig_cl_ord_id) orelse return error.UnknownOrigClOrdID;
+        const event = CommandEvent{ .cancel = .{
+            .instrument_id = mapping.instrument_id,
+            .order_id = mapping.order_id,
+        } };
+        try self.applyAuthoritative(writer, books, segment, event, cl_ord_id);
+        try self.storeMapping(cl_ord_id, mapping.instrument_id, mapping.order_id);
+    }
+
+    fn applyAuthoritative(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        books: *BookSet,
+        segment: anytype,
+        event: CommandEvent,
+        cl_ord_id: []const u8,
+    ) !void {
+        const authoritative_sequence = self.next_authoritative_sequence;
+        self.next_authoritative_sequence += 1;
+        try appendJournalEvent(segment, event);
+        const result = try applyCommandEventStructured(books, event);
+        try self.writeExecutionReports(writer, cl_ord_id, authoritative_sequence, &result);
+    }
+
+    fn writeExecutionReports(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        cl_ord_id: []const u8,
+        authoritative_sequence: u64,
+        result: *const CommandResult,
+    ) !void {
+        switch (result.*) {
+            .submitted => |submitted| {
+                if (submitted.match_result.trade_count == 0 and submitted.match_result.resting_quantity > 0) {
+                    try self.writeExecutionReport(writer, cl_ord_id, submitted.order.id, "0", "0", submitted.order.quantity, "New", authoritative_sequence);
+                }
+                var index: usize = 0;
+                while (index < submitted.match_result.trade_count) : (index += 1) {
+                    const trade = submitted.match_result.trades[index];
+                    const ord_status = if (index + 1 == submitted.match_result.trade_count and submitted.match_result.resting_quantity == 0) "2" else "1";
+                    try self.writeExecutionReport(writer, cl_ord_id, submitted.order.id, "F", ord_status, trade.quantity, "Fill", authoritative_sequence);
+                }
+            },
+            .canceled => |instrumented| try self.writeExecutionReport(writer, cl_ord_id, instrumented.order_id, "4", "4", 0, "Canceled", authoritative_sequence),
+            .not_found => |instrumented| try self.writeExecutionReport(writer, cl_ord_id, instrumented.order_id, "8", "8", 0, "NotFound", authoritative_sequence),
+            .rejected => |rejected| try self.writeExecutionReport(
+                writer,
+                cl_ord_id,
+                rejected.order_id,
+                "8",
+                "8",
+                0,
+                @tagName(rejected.reason),
+                authoritative_sequence,
+            ),
+        }
+    }
+
+    fn writeExecutionReport(
+        self: *FixSession,
+        writer: *std.Io.Writer,
+        cl_ord_id: []const u8,
+        order_id: engine.OrderId,
+        exec_type: []const u8,
+        ord_status: []const u8,
+        last_qty: engine.Quantity,
+        text: []const u8,
+        authoritative_sequence: u64,
+    ) !void {
+        const exec_id = self.next_exec_id;
+        self.next_exec_id += 1;
+        try self.writeMessagePrefix(writer, "8");
+        try writer.print(
+            "11={s}|37={d}|17={d}.{d}|150={s}|39={s}|32={d}|58={s}|\n",
+            .{ cl_ord_id, order_id, authoritative_sequence, exec_id, exec_type, ord_status, last_qty, text },
+        );
+    }
+
+    fn writeSessionMessage(self: *FixSession, writer: *std.Io.Writer, msg_type: []const u8, extra: ?FixField) !void {
+        try self.writeMessagePrefix(writer, msg_type);
+        if (extra) |field| try writer.print("{d}={s}|", .{ field.tag, field.value });
+        try writer.writeByte('\n');
+    }
+
+    fn writeMessagePrefix(self: *FixSession, writer: *std.Io.Writer, msg_type: []const u8) !void {
+        const seq = self.next_out_seq;
+        self.next_out_seq += 1;
+        try writer.print(
+            "{s}|35={s}|34={d}|49={s}|56={s}|",
+            .{ fix_begin_string, msg_type, seq, fix_exchange_id, self.sender },
+        );
+    }
+
+    fn findMapping(self: *const FixSession, cl_ord_id: []const u8) ?FixClOrdMapping {
+        var index: usize = 0;
+        while (index < self.mapping_count) : (index += 1) {
+            const mapping = self.mappings[index];
+            if (std.mem.eql(u8, mapping.cl_ord_id, cl_ord_id)) return mapping;
+        }
+        return null;
+    }
+
+    fn storeMapping(self: *FixSession, cl_ord_id: []const u8, instrument_id: InstrumentId, order_id: engine.OrderId) !void {
+        if (self.mapping_count == self.mappings.len) return error.FixClOrdMapFull;
+        self.mappings[self.mapping_count] = .{
+            .cl_ord_id = cl_ord_id,
+            .instrument_id = instrument_id,
+            .order_id = order_id,
+        };
+        self.mapping_count += 1;
+    }
+};
+
+fn symbolToInstrumentId(symbol: []const u8) !InstrumentId {
+    if (symbol.len == 3 and symbol[0] == 'N' and symbol[1] == 'M') {
+        const digit = symbol[2];
+        if (digit >= '1' and digit <= '0' + max_instruments) {
+            return @intCast(digit - '0');
+        }
+    }
+    return error.UnknownInstrument;
+}
+
+fn fixSideToEngineSide(value: []const u8) !engine.Side {
+    if (std.mem.eql(u8, value, "1")) return .buy;
+    if (std.mem.eql(u8, value, "2")) return .sell;
+    return error.InvalidFixSide;
 }
 
 const generated_history_max = 240;
@@ -1118,6 +1460,259 @@ test "journal replay matches routed live input output and final book state" {
     try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
 
     try expectOutput(&replay_writer, live_writer.buffered());
+    try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "FIX session handles logon heartbeat test request and logout" {
+    var session = FixSession{};
+    var books = BookSet.init();
+    var output_buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    const NoJournal = struct {
+        fn appendSubmitLimit(_: *@This(), _: InstrumentId, _: engine.Order) !void {
+            return error.UnexpectedJournalAppend;
+        }
+
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            return error.UnexpectedJournalAppend;
+        }
+    };
+    var no_journal = NoJournal{};
+
+    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=1|34=2|49=CLIENT1|56=NEONMATCH|112=T1|");
+    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=0|34=3|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=5|34=4|49=CLIENT1|56=NEONMATCH|");
+
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=A|34=1|49=NEONMATCH|56=CLIENT1|\n" ++
+            "8=FIX.4.4|35=0|34=2|49=NEONMATCH|56=CLIENT1|112=T1|\n" ++
+            "8=FIX.4.4|35=0|34=3|49=NEONMATCH|56=CLIENT1|\n" ++
+            "8=FIX.4.4|35=5|34=4|49=NEONMATCH|56=CLIENT1|\n",
+    );
+    try expectBooksEqual(&BookSet.init(), &books);
+}
+
+test "FIX NewOrderSingle maps through journaled authoritative command and emits execution reports" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+        last_instrument_id: InstrumentId = 0,
+        last_order: engine.Order = undefined,
+
+        fn appendSubmitLimit(self: *@This(), instrument_id: InstrumentId, order: engine.Order) !void {
+            self.append_count += 1;
+            self.last_instrument_id = instrument_id;
+            self.last_order = order;
+        }
+
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            return error.UnexpectedCancelAppend;
+        }
+    };
+
+    var session = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM2|54=1|44=100|38=5|");
+
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
+    try std.testing.expectEqual(@as(InstrumentId, 2), journal_segment.last_instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 101), journal_segment.last_order.id);
+    const book = try books.bookFor(2);
+    try std.testing.expectEqual(@as(usize, 1), book.bid_count);
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=2|49=NEONMATCH|56=CLIENT1|11=101|37=101|17=1.1|150=0|39=0|32=5|58=New|\n",
+    );
+}
+
+test "FIX order-entry semantic rejects are journaled and reported without mutation" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(_: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            return error.UnexpectedCancelAppend;
+        }
+    };
+
+    var session = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var discard_buffer: [64]u8 = undefined;
+    var discard_writer = std.Io.Writer.fixed(&discard_buffer);
+
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    var id: engine.OrderId = 1;
+    while (id <= engine.max_orders) : (id += 1) {
+        discard_writer.end = 0;
+        try applyCommandEvent(&discard_writer, &books, instrumentBuy(1, id, 100, 1));
+    }
+    writer.end = 0;
+    const before = books;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=1000|55=NM1|54=1|44=99|38=1|");
+
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=2|49=NEONMATCH|56=CLIENT1|11=1000|37=1000|17=1.1|150=8|39=8|32=0|58=BookFull|\n",
+    );
+}
+
+test "FIX malformed or untranslatable messages do not journal or mutate" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    const before = books;
+    try std.testing.expectError(
+        error.UnknownInstrument,
+        session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=BAD|54=1|44=100|38=5|"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), journal_segment.append_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(&writer, "");
+}
+
+test "FIX cancel resolves OrigClOrdID and reaches the journaled cancel path" {
+    const CountingJournal = struct {
+        submit_count: usize = 0,
+        cancel_count: usize = 0,
+        cancel_instrument_id: InstrumentId = 0,
+        cancel_order_id: engine.OrderId = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.submit_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), instrument_id: InstrumentId, order_id: engine.OrderId) !void {
+            self.cancel_count += 1;
+            self.cancel_instrument_id = instrument_id;
+            self.cancel_order_id = order_id;
+        }
+    };
+
+    var session = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM3|54=1|44=100|38=5|");
+    writer.end = 0;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=F|34=3|49=CLIENT1|56=NEONMATCH|11=102|41=101|");
+
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.submit_count);
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.cancel_count);
+    try std.testing.expectEqual(@as(InstrumentId, 3), journal_segment.cancel_instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 101), journal_segment.cancel_order_id);
+    const book = try books.bookFor(3);
+    try std.testing.expectEqual(@as(usize, 0), book.bid_count);
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=3|49=NEONMATCH|56=CLIENT1|11=102|37=101|17=2.2|150=4|39=4|32=0|58=Canceled|\n",
+    );
+}
+
+test "FIX ExecutionReport distinguishes partial fill full fill and cancel not found" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=201|55=NM1|54=2|44=100|38=5|");
+    writer.end = 0;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=202|55=NM1|54=1|44=100|38=2|");
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=3|49=NEONMATCH|56=CLIENT1|11=202|37=202|17=2.2|150=F|39=2|32=2|58=Fill|\n",
+    );
+
+    writer.end = 0;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=4|49=CLIENT1|56=NEONMATCH|11=203|55=NM1|54=1|44=100|38=5|");
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=4|49=NEONMATCH|56=CLIENT1|11=203|37=203|17=3.3|150=F|39=1|32=3|58=Fill|\n",
+    );
+
+    writer.end = 0;
+    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=F|34=5|49=CLIENT1|56=NEONMATCH|11=204|41=201|");
+    try expectOutput(
+        &writer,
+        "8=FIX.4.4|35=8|34=5|49=NEONMATCH|56=CLIENT1|11=204|37=201|17=4.4|150=8|39=8|32=0|58=NotFound|\n",
+    );
+    try std.testing.expectEqual(@as(usize, 4), journal_segment.append_count);
+}
+
+test "FIX journaled commands replay to the same book state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var journal_dir_buffer: [64]u8 = undefined;
+    const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var segment = try journal.Segment.open(io, journal_dir);
+    var session = FixSession{};
+    var live_books = BookSet.init();
+    var live_output_buffer: [4096]u8 = undefined;
+    var live_writer = std.Io.Writer.fixed(&live_output_buffer);
+
+    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=2|44=100|38=5|");
+    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=102|55=NM1|54=1|44=100|38=2|");
+    segment.close();
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try singleJournalPath(io, &tmp, journal_dir, &journal_path_buffer);
+    var replay_books = BookSet.init();
+    var replay_output_buffer: [4096]u8 = undefined;
+    var replay_writer = std.Io.Writer.fixed(&replay_output_buffer);
+    try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
+
     try expectBooksEqual(&live_books, &replay_books);
 }
 
