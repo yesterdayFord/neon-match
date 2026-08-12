@@ -31,6 +31,16 @@ High-level product direction and bounded project phases live in [ROADMAP.md](ROA
 
 This brief documents the current project architecture, principles, scope, and durable engineering decisions. Detailed implementation work belongs in GitHub issues, pull requests, tests, and code rather than in a second roadmap here.
 
+## External Protocol Guidance
+
+NeonMatch's initial real external protocol is FIX 4.4, using the classic `8=FIX.4.4` session profile rather than beginning with FIXT 1.1 or multi-version FIX support.
+
+FIX is an ingress/egress adapter around the existing NeonMatch authority model. FIX session parsing and validation must translate external messages into the internal authoritative command model, establish deterministic command order, and then submit `CommandEvent` values through the same journal and matcher path used by other clients.
+
+FIX fields must not leak deeply into the matcher. Execution responses, market data, and other outbound messages are derived output from NeonMatch state transitions, not separate sources of authority.
+
+The CLI remains the reference/debug client. A GUI client belongs only where it helps humans understand, exercise, or operate the exchange without bypassing the same authoritative boundaries.
+
 ## Journaling Guidance
 
 The journal preserves the ordered input truth of the engine.

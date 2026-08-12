@@ -80,11 +80,13 @@ Hardening should stay practical: validate invariants, generate deterministic com
 
 **Entry condition:** The multi-instrument core is stable enough to be driven by external clients.
 
-**Outcome:** Define the boundary between NeonMatch and real exchange participants or upstream systems.
+**Outcome:** Define the boundary between NeonMatch and real exchange participants or upstream systems, starting with FIX 4.4 as the first external ingress/egress protocol.
 
 This includes session/protocol ingress and authoritative command submission, plus market-data or other derived output. Commands and derived output must remain conceptually separate.
 
 External arrival order is not authoritative until NeonMatch establishes an explicit deterministic command order. The ingress boundary must convert externally arriving requests into that authoritative order before they mutate exchange state or enter authoritative history.
+
+FIX is an adapter around NeonMatch's authoritative command and event boundaries, not a replacement domain model for the matcher. The initial direction is narrow order-entry ingress and execution-response egress before broader market-data behavior.
 
 Reference clients should exist at more than one level where useful:
 
@@ -175,6 +177,7 @@ The same architecture should scale from a tiny demonstration appliance to produc
 **Done when:** A real operator can choose NeonMatch instead of a commercial exchange platform without giving up the capabilities they actually require.
 
 ---
+
 ## Interface Principle
 
 Every important interface should have a simple machine-facing form and, where useful, a human-facing form.
