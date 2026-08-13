@@ -35,7 +35,7 @@ This brief documents the current project architecture, principles, scope, and du
 
 NeonMatch's initial real external protocol is FIX 4.4 including the 2003-06-18 errata, using the classic `8=FIX.4.4` session profile rather than beginning with FIXT 1.1 or multi-version FIX support.
 
-FIX is an ingress/egress adapter around the existing NeonMatch authority model. FIX session parsing and validation must translate external messages into the internal authoritative command model, establish deterministic command order, and then submit `CommandEvent` values through the same journal and matcher path used by other clients.
+FIX is an ingress/egress adapter around the existing NeonMatch authority model. FIX session parsing and validation must translate external messages into valid command candidates; an explicit authoritative sequencing boundary then deterministically orders those candidates and submits `CommandEvent` values through the same journal and matcher path used by other clients.
 
 FIX fields must not leak deeply into the matcher. Execution responses, market data, and other outbound messages are derived output from NeonMatch state transitions, not separate sources of authority.
 

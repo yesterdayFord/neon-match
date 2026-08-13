@@ -61,6 +61,30 @@ const RejectedCommand = struct {
     reason: RejectReason,
 };
 
+const SequencedCommandResult = struct {
+    authoritative_sequence: u64,
+    result: CommandResult,
+};
+
+const AuthoritativeSequencer = struct {
+    next_sequence: u64 = 1,
+
+    fn submit(
+        self: *AuthoritativeSequencer,
+        books: *BookSet,
+        segment: anytype,
+        event: CommandEvent,
+    ) !SequencedCommandResult {
+        const sequence = self.next_sequence;
+        try appendJournalEvent(segment, event);
+        self.next_sequence += 1;
+        return .{
+            .authoritative_sequence = sequence,
+            .result = try applyCommandEventStructured(books, event),
+        };
+    }
+};
+
 fn instrumentIndex(instrument_id: InstrumentId) !usize {
     if (instrument_id == 0 or instrument_id > max_instruments) return error.UnknownInstrument;
     return @intCast(instrument_id - 1);
@@ -831,7 +855,6 @@ const FixClOrdMapping = struct {
 const FixSession = struct {
     expected_in_seq: u64 = 1,
     next_out_seq: u64 = 1,
-    next_authoritative_sequence: u64 = 1,
     next_exec_id: u64 = 1,
     logged_on: bool = false,
     sender: []const u8 = "",
@@ -843,6 +866,7 @@ const FixSession = struct {
         self: *FixSession,
         writer: *std.Io.Writer,
         books: *BookSet,
+        sequencer: *AuthoritativeSequencer,
         segment: anytype,
         bytes: []const u8,
     ) !void {
@@ -853,8 +877,8 @@ const FixSession = struct {
         if (std.mem.eql(u8, msg_type, "0")) return self.handleHeartbeat(writer);
         if (std.mem.eql(u8, msg_type, "1")) return self.handleTestRequest(writer, &message);
         if (!self.logged_on) return error.FixSessionNotLoggedOn;
-        if (std.mem.eql(u8, msg_type, "D")) return self.handleNewOrderSingle(writer, books, segment, &message);
-        if (std.mem.eql(u8, msg_type, "F")) return self.handleOrderCancelRequest(writer, books, segment, &message);
+        if (std.mem.eql(u8, msg_type, "D")) return self.handleNewOrderSingle(writer, books, sequencer, segment, &message);
+        if (std.mem.eql(u8, msg_type, "F")) return self.handleOrderCancelRequest(writer, books, sequencer, segment, &message);
         return error.UnsupportedFixMsgType;
     }
 
@@ -898,6 +922,7 @@ const FixSession = struct {
         self: *FixSession,
         writer: *std.Io.Writer,
         books: *BookSet,
+        sequencer: *AuthoritativeSequencer,
         segment: anytype,
         message: *const FixMessage,
     ) !void {
@@ -913,7 +938,7 @@ const FixSession = struct {
             .quantity = try parsePositive(engine.Quantity, try message.required(38)),
         };
         const event = CommandEvent{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
-        try self.applyAuthoritative(writer, books, segment, event, cl_ord_id);
+        try self.applyAuthoritative(writer, books, sequencer, segment, event, cl_ord_id);
         try self.storeMapping(cl_ord_id, instrument_id, order_id);
     }
 
@@ -921,6 +946,7 @@ const FixSession = struct {
         self: *FixSession,
         writer: *std.Io.Writer,
         books: *BookSet,
+        sequencer: *AuthoritativeSequencer,
         segment: anytype,
         message: *const FixMessage,
     ) !void {
@@ -932,7 +958,7 @@ const FixSession = struct {
             .instrument_id = mapping.instrument_id,
             .order_id = mapping.order_id,
         } };
-        try self.applyAuthoritative(writer, books, segment, event, cl_ord_id);
+        try self.applyAuthoritative(writer, books, sequencer, segment, event, cl_ord_id);
         try self.storeMapping(cl_ord_id, mapping.instrument_id, mapping.order_id);
     }
 
@@ -940,15 +966,13 @@ const FixSession = struct {
         self: *FixSession,
         writer: *std.Io.Writer,
         books: *BookSet,
+        sequencer: *AuthoritativeSequencer,
         segment: anytype,
         event: CommandEvent,
         cl_ord_id: []const u8,
     ) !void {
-        const authoritative_sequence = self.next_authoritative_sequence;
-        self.next_authoritative_sequence += 1;
-        try appendJournalEvent(segment, event);
-        const result = try applyCommandEventStructured(books, event);
-        try self.writeExecutionReports(writer, cl_ord_id, authoritative_sequence, &result);
+        const sequenced = try sequencer.submit(books, segment, event);
+        try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
     }
 
     fn writeExecutionReports(
@@ -1465,6 +1489,7 @@ test "journal replay matches routed live input output and final book state" {
 
 test "FIX session handles logon heartbeat test request and logout" {
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var output_buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
@@ -1479,10 +1504,10 @@ test "FIX session handles logon heartbeat test request and logout" {
     };
     var no_journal = NoJournal{};
 
-    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
-    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=1|34=2|49=CLIENT1|56=NEONMATCH|112=T1|");
-    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=0|34=3|49=CLIENT1|56=NEONMATCH|");
-    try session.handle(&writer, &books, &no_journal, "8=FIX.4.4|35=5|34=4|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &no_journal, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &no_journal, "8=FIX.4.4|35=1|34=2|49=CLIENT1|56=NEONMATCH|112=T1|");
+    try session.handle(&writer, &books, &sequencer, &no_journal, "8=FIX.4.4|35=0|34=3|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &no_journal, "8=FIX.4.4|35=5|34=4|49=CLIENT1|56=NEONMATCH|");
 
     try expectOutput(
         &writer,
@@ -1512,14 +1537,15 @@ test "FIX NewOrderSingle maps through journaled authoritative command and emits 
     };
 
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var journal_segment = CountingJournal{};
     var output_buffer: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
     writer.end = 0;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM2|54=1|44=100|38=5|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM2|54=1|44=100|38=5|");
 
     try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
     try std.testing.expectEqual(@as(InstrumentId, 2), journal_segment.last_instrument_id);
@@ -1546,6 +1572,7 @@ test "FIX order-entry semantic rejects are journaled and reported without mutati
     };
 
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var journal_segment = CountingJournal{};
     var output_buffer: [2048]u8 = undefined;
@@ -1553,7 +1580,7 @@ test "FIX order-entry semantic rejects are journaled and reported without mutati
     var discard_buffer: [64]u8 = undefined;
     var discard_writer = std.Io.Writer.fixed(&discard_buffer);
 
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
     var id: engine.OrderId = 1;
     while (id <= engine.max_orders) : (id += 1) {
         discard_writer.end = 0;
@@ -1561,7 +1588,7 @@ test "FIX order-entry semantic rejects are journaled and reported without mutati
     }
     writer.end = 0;
     const before = books;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=1000|55=NM1|54=1|44=99|38=1|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=1000|55=NM1|54=1|44=99|38=1|");
 
     try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
     try expectBooksEqual(&before, &books);
@@ -1585,17 +1612,18 @@ test "FIX malformed or untranslatable messages do not journal or mutate" {
     };
 
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var journal_segment = CountingJournal{};
     var output_buffer: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
     writer.end = 0;
     const before = books;
     try std.testing.expectError(
         error.UnknownInstrument,
-        session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=BAD|54=1|44=100|38=5|"),
+        session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=BAD|54=1|44=100|38=5|"),
     );
 
     try std.testing.expectEqual(@as(usize, 0), journal_segment.append_count);
@@ -1622,15 +1650,16 @@ test "FIX cancel resolves OrigClOrdID and reaches the journaled cancel path" {
     };
 
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var journal_segment = CountingJournal{};
     var output_buffer: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM3|54=1|44=100|38=5|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM3|54=1|44=100|38=5|");
     writer.end = 0;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=F|34=3|49=CLIENT1|56=NEONMATCH|11=102|41=101|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=F|34=3|49=CLIENT1|56=NEONMATCH|11=102|41=101|");
 
     try std.testing.expectEqual(@as(usize, 1), journal_segment.submit_count);
     try std.testing.expectEqual(@as(usize, 1), journal_segment.cancel_count);
@@ -1658,29 +1687,30 @@ test "FIX ExecutionReport distinguishes partial fill full fill and cancel not fo
     };
 
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var books = BookSet.init();
     var journal_segment = CountingJournal{};
     var output_buffer: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output_buffer);
 
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=201|55=NM1|54=2|44=100|38=5|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=201|55=NM1|54=2|44=100|38=5|");
     writer.end = 0;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=202|55=NM1|54=1|44=100|38=2|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=202|55=NM1|54=1|44=100|38=2|");
     try expectOutput(
         &writer,
         "8=FIX.4.4|35=8|34=3|49=NEONMATCH|56=CLIENT1|11=202|37=202|17=2.2|150=F|39=2|32=2|58=Fill|\n",
     );
 
     writer.end = 0;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=D|34=4|49=CLIENT1|56=NEONMATCH|11=203|55=NM1|54=1|44=100|38=5|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=4|49=CLIENT1|56=NEONMATCH|11=203|55=NM1|54=1|44=100|38=5|");
     try expectOutput(
         &writer,
         "8=FIX.4.4|35=8|34=4|49=NEONMATCH|56=CLIENT1|11=203|37=203|17=3.3|150=F|39=1|32=3|58=Fill|\n",
     );
 
     writer.end = 0;
-    try session.handle(&writer, &books, &journal_segment, "8=FIX.4.4|35=F|34=5|49=CLIENT1|56=NEONMATCH|11=204|41=201|");
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=F|34=5|49=CLIENT1|56=NEONMATCH|11=204|41=201|");
     try expectOutput(
         &writer,
         "8=FIX.4.4|35=8|34=5|49=NEONMATCH|56=CLIENT1|11=204|37=201|17=4.4|150=8|39=8|32=0|58=NotFound|\n",
@@ -1697,13 +1727,14 @@ test "FIX journaled commands replay to the same book state" {
     const journal_dir = try std.fmt.bufPrint(&journal_dir_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     var segment = try journal.Segment.open(io, journal_dir);
     var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
     var live_books = BookSet.init();
     var live_output_buffer: [4096]u8 = undefined;
     var live_writer = std.Io.Writer.fixed(&live_output_buffer);
 
-    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
-    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=2|44=100|38=5|");
-    try session.handle(&live_writer, &live_books, &segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=102|55=NM1|54=1|44=100|38=2|");
+    try session.handle(&live_writer, &live_books, &sequencer, &segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session.handle(&live_writer, &live_books, &sequencer, &segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=2|44=100|38=5|");
+    try session.handle(&live_writer, &live_books, &sequencer, &segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=102|55=NM1|54=1|44=100|38=2|");
     segment.close();
 
     var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -1714,6 +1745,88 @@ test "FIX journaled commands replay to the same book state" {
     try replayJournalPath(io, &replay_writer, &replay_books, journal_path);
 
     try expectBooksEqual(&live_books, &replay_books);
+}
+
+test "FIX sessions share one authoritative command sequencing boundary" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var sequencer = AuthoritativeSequencer{};
+    var session_a = FixSession{};
+    var session_b = FixSession{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_a_buffer: [4096]u8 = undefined;
+    var output_b_buffer: [4096]u8 = undefined;
+    var writer_a = std.Io.Writer.fixed(&output_a_buffer);
+    var writer_b = std.Io.Writer.fixed(&output_b_buffer);
+
+    try session_a.handle(&writer_a, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    try session_b.handle(&writer_b, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT2|56=NEONMATCH|");
+    writer_a.end = 0;
+    writer_b.end = 0;
+
+    try session_a.handle(&writer_a, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=1|44=100|38=5|");
+    try session_b.handle(&writer_b, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT2|56=NEONMATCH|11=201|55=NM2|54=1|44=101|38=5|");
+    try session_a.handle(&writer_a, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=3|49=CLIENT1|56=NEONMATCH|11=102|55=NM1|54=2|44=100|38=2|");
+
+    try std.testing.expectEqual(@as(usize, 3), journal_segment.append_count);
+    try std.testing.expectEqual(@as(u64, 4), sequencer.next_sequence);
+    try expectOutput(
+        &writer_a,
+        "8=FIX.4.4|35=8|34=2|49=NEONMATCH|56=CLIENT1|11=101|37=101|17=1.1|150=0|39=0|32=5|58=New|\n" ++
+            "8=FIX.4.4|35=8|34=3|49=NEONMATCH|56=CLIENT1|11=102|37=102|17=3.2|150=F|39=2|32=2|58=Fill|\n",
+    );
+    try expectOutput(
+        &writer_b,
+        "8=FIX.4.4|35=8|34=2|49=NEONMATCH|56=CLIENT2|11=201|37=201|17=2.1|150=0|39=0|32=5|58=New|\n",
+    );
+}
+
+test "FIX append failure prevents sequencing application mapping and output" {
+    const FailingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+            return error.JournalWriteFailed;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+            return error.JournalWriteFailed;
+        }
+    };
+
+    var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
+    var books = BookSet.init();
+    var failing_journal = FailingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &sequencer, &failing_journal, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    const before = books;
+    try std.testing.expectError(
+        error.JournalWriteFailed,
+        session.handle(&writer, &books, &sequencer, &failing_journal, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=1|44=100|38=5|"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), failing_journal.append_count);
+    try std.testing.expectEqual(@as(u64, 1), sequencer.next_sequence);
+    try std.testing.expectEqual(@as(usize, 0), session.mapping_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(&writer, "");
 }
 
 test "invalid routed instruments are not journaled and do not mutate books" {
