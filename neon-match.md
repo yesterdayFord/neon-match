@@ -33,7 +33,7 @@ This brief documents the current project architecture, principles, scope, and du
 
 ## External Protocol Guidance
 
-NeonMatch's initial real external protocol is FIX 4.4, using the classic `8=FIX.4.4` session profile rather than beginning with FIXT 1.1 or multi-version FIX support.
+NeonMatch's initial real external protocol is FIX 4.4 including the 2003-06-18 errata, using the classic `8=FIX.4.4` session profile rather than beginning with FIXT 1.1 or multi-version FIX support.
 
 FIX is an ingress/egress adapter around the existing NeonMatch authority model. FIX session parsing and validation must translate external messages into the internal authoritative command model, establish deterministic command order, and then submit `CommandEvent` values through the same journal and matcher path used by other clients.
 
