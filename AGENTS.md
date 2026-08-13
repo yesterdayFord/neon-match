@@ -2,9 +2,11 @@
 
 <!--
 Engineering guidance snapshot:
+- Source: engineering/principles/viho.md
+- VIHO version: 0.3.0
 - Source: engineering/languages/zig/base.md
 - Source: engineering/languages/zig/versions/0.17.md
-- Snapshot date: 2026-07-27
+- Snapshot date: 2026-08-13
 - Source revision: unavailable
 -->
 
@@ -75,23 +77,27 @@ When local Git is required for working-tree state, rebases, merges, commits, or 
 
 ## Shared Engineering Guidance
 
-NeonMatch consumes canonical VIHO guidance from `engineering/principles/viho.md` as shared engineering guidance, currently targeting VIHO `0.3.0`.
+NeonMatch consumes local snapshots of shared engineering guidance under `docs/agent/`.
 
-Before architectural or performance-sensitive work, retrieve and read the canonical VIHO document from `engineering/principles/viho.md`. If it cannot be retrieved, report that clearly instead of using a remembered or cached version.
+Before architectural or performance-sensitive work, read the checked-in VIHO snapshot at `docs/agent/viho.md`. Do not fetch VIHO from sibling repositories, parent directories, symlinks, or live shared-guidance paths while working in this repository.
 
-Do not copy, vendor, summarize, or maintain a local `viho.md`. VIHO is shared guidance: explicit NeonMatch requirements and repository-local instructions take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
+The current VIHO snapshot is `0.3.0`, copied from `engineering/principles/viho.md` with reference date `2026-06-29`.
+
+VIHO is shared guidance: explicit NeonMatch requirements and repository-local instructions take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
 
 VIHO adoption policy:
 
 - Patch revisions may be adopted immediately.
 - Minor revisions should be adopted at a clean boundary, normally after a clean merge.
 - Major revisions require explicit review and a migration decision. They may require validation in a separate real project before NeonMatch adopts them.
-- Never interrupt active work merely because VIHO changed.
+- Never interrupt active work merely because upstream VIHO changed.
+- Refresh local snapshots only through a deliberate repository change.
 
 ## Zig Guidance Snapshot
 
 Copied guidance lives under `docs/agent/`:
 
+- `docs/agent/viho.md`
 - `docs/agent/zig.md`
 - `docs/agent/zig-0.17.md`
 
