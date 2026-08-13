@@ -1,17 +1,18 @@
 <!--
-Source: engineering/principles/viho.md
-VIHO version: 0.3.0
-Reference date: 2026-06-29
-Snapshot date: 2026-08-13
-Source revision: unavailable
+Source repository: yesterdayFord/engineering
+Source: principles/viho.md
+VIHO version: 0.3.2
+Reference date: 2026-08-12
+Snapshot date: 2026-08-12
+Source revision: 25061973d755cca6cfcdb4839d4277e5ce7bbc24
 -->
 
 # VIHO
 
 **Vertically Integrated Hardware Orchestration**
 
-Version 0.3.0
-Reference date: 2026-06-29
+Version 0.3.2  
+Reference date: 2026-08-12
 
 VIHO is an engineering lens for systems in which topology, locality, ownership, data movement, coordination, and failure behavior materially affect correctness or performance.
 
