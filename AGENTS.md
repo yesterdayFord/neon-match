@@ -1,9 +1,15 @@
 # AGENTS.md
 
 <!--
-Engineering guidance snapshot:
-- Source: engineering/principles/viho.md
-- VIHO version: 0.3.0
+Shared engineering guidance snapshots:
+- Source repository: yesterdayFord/engineering
+- Source: principles/viho.md
+- VIHO version: 0.3.2
+- Source: principles/engineering.md
+- Shared-guidance snapshot date: 2026-08-12
+- Shared-guidance source revision: 25061973d755cca6cfcdb4839d4277e5ce7bbc24
+
+Language guidance snapshot:
 - Source: engineering/languages/zig/base.md
 - Source: engineering/languages/zig/versions/0.17.md
 - Snapshot date: 2026-08-13
@@ -19,7 +25,7 @@ This file is a portable project-local snapshot. The repository must not require 
 - This `AGENTS.md` applies to files in this directory and its subdirectories.
 - A deeper `AGENTS.md` may add to or override these instructions for its own subtree.
 - Instructions from unrelated directories do not apply.
-- Markdown links do not import instructions. Linked guidance is inactive unless its relevant text is copied here.
+- Markdown links do not import instructions. Linked guidance is inactive unless its relevant text is copied into the repository and explicitly adopted here.
 
 ## Canonical Project Documents
 
@@ -77,31 +83,39 @@ When local Git is required for working-tree state, rebases, merges, commits, or 
 
 ## Shared Engineering Guidance
 
-NeonMatch consumes local snapshots of shared engineering guidance under `docs/agent/`.
+NeonMatch consumes checked-in snapshots of shared engineering guidance under `docs/agent/`.
 
-Before architectural or performance-sensitive work, read the checked-in VIHO snapshot at `docs/agent/viho.md`. Do not fetch VIHO from sibling repositories, parent directories, symlinks, or live shared-guidance paths while working in this repository.
+- `docs/agent/viho.md` contains the adopted VIHO architecture guidance.
+- `docs/agent/engineering.md` contains broader engineering design principles.
 
-The current VIHO snapshot is `0.3.0`, copied from `engineering/principles/viho.md` with reference date `2026-06-29`.
+Before architectural or performance-sensitive work, read `docs/agent/viho.md`.
 
-VIHO is shared guidance: explicit NeonMatch requirements and repository-local instructions take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
+When making design, interface, representation, maintainability, or abstraction decisions, apply `docs/agent/engineering.md` as relevant. In particular, preserve the domain model and clear interfaces before optimizing local data-structure or syntax convenience.
 
-VIHO adoption policy:
+Do not fetch shared guidance from sibling repositories, parent directories, symlinks, or live shared-guidance paths while working in this repository.
 
-- Patch revisions may be adopted immediately.
-- Minor revisions should be adopted at a clean boundary, normally after a clean merge.
-- Major revisions require explicit review and a migration decision. They may require validation in a separate real project before NeonMatch adopts them.
-- Never interrupt active work merely because upstream VIHO changed.
+The current VIHO snapshot is `0.3.2`, copied from `principles/viho.md`. The current general engineering snapshot was copied from `principles/engineering.md`. Both were taken from `yesterdayFord/engineering` revision `25061973d755cca6cfcdb4839d4277e5ce7bbc24`.
+
+Shared guidance does not override NeonMatch. Explicit NeonMatch requirements, repository-local instructions, current code, and tests take precedence. NeonMatch-specific decisions, adaptations, and justified exceptions remain in NeonMatch.
+
+Shared-guidance adoption policy:
+
+- Never interrupt active work merely because upstream shared guidance changed.
 - Refresh local snapshots only through a deliberate repository change.
+- Small clarifications may be adopted at a clean boundary.
+- Meaningful behavioral or architectural guidance changes require explicit review before adoption.
+- Major changes should be treated like a policy migration and may require validation in another project before NeonMatch adopts them.
 
 ## Zig Guidance Snapshot
 
 Copied guidance lives under `docs/agent/`:
 
 - `docs/agent/viho.md`
+- `docs/agent/engineering.md`
 - `docs/agent/zig.md`
 - `docs/agent/zig-0.17.md`
 
-The canonical Zig guide has not been written yet. For now, treat those files as placeholders for copied Zig-wide guidance once it is established under `engineering/languages/zig/`. Do not infer extra Zig standards from the existence of the placeholders.
+The canonical Zig guide has not been written yet. For now, treat the Zig files as placeholders for copied Zig-wide guidance once it is established under `engineering/languages/zig/`. Do not infer extra Zig standards from the existence of the placeholders.
 
 ## Matching Engine Project Guidance
 
@@ -118,5 +132,5 @@ The canonical Zig guide has not been written yet. For now, treat those files as 
 ## Portability
 
 - Do not add symlinks to shared engineering guidance.
-- Do not require shared `engineering/` paths in build scripts, tests, editor settings, or CI.
-- If language guidance is refreshed from `engineering/`, update the snapshot metadata above.
+- Do not require shared `engineering/` paths in build scripts, tests, editor settings, CI, or agent instructions.
+- If shared guidance is refreshed from `yesterdayFord/engineering`, update the local snapshots and provenance metadata together.
