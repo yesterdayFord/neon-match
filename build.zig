@@ -57,6 +57,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const fix_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fix.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     const journal_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/journal.zig"),
@@ -86,12 +93,14 @@ pub fn build(b: *std.Build) void {
 
     const run_tests = b.addRunArtifact(tests);
     const run_main_tests = b.addRunArtifact(main_tests);
+    const run_fix_tests = b.addRunArtifact(fix_tests);
     const run_journal_tests = b.addRunArtifact(journal_tests);
     const run_bench_tests = b.addRunArtifact(bench_tests);
     const run_behavior_tests = b.addRunArtifact(behavior_tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_main_tests.step);
+    test_step.dependOn(&run_fix_tests.step);
     test_step.dependOn(&run_journal_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_behavior_tests.step);

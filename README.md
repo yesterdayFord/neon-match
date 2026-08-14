@@ -61,7 +61,9 @@ The current preserved baseline is [docs/benchmarks/2026-08-07-baseline.md](docs/
 
 ## Layout
 
-- `src/main.zig` - stdin command loop
+- `src/main.zig` - process control, CLI command loop, and replay wiring
+- `src/exchange.zig` - shared command/event, book-set, result, and authoritative sequencing boundary
+- `src/fix.zig` - narrow FIX 4.4 adapter/session boundary
 - `src/engine.zig` - fixed-capacity matching engine
 - `src/bench.zig` - deterministic benchmark harness
 - `tests/` - public behavior and regression-style tests
