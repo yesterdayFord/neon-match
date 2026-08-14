@@ -66,6 +66,11 @@ fn isFixDelimiter(byte: u8) bool {
     return byte == 1 or byte == '|' or byte == '\r' or byte == '\n';
 }
 
+const PendingFixClOrdMapping = struct {
+    index: usize,
+    mapping: FixClOrdMapping,
+};
+
 const FixClOrdMapping = struct {
     cl_ord_id: [max_fix_cl_ord_id_len]u8,
     cl_ord_id_len: usize,
@@ -152,8 +157,8 @@ const FixSession = struct {
         message: *const FixMessage,
     ) !void {
         const cl_ord_id = try message.required(11);
+        try self.ensureMappingSlotAndLength(cl_ord_id);
         if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
-        try self.ensureCanStoreMapping(cl_ord_id);
         const instrument_id = try symbolToInstrumentId(try message.required(55));
         const side = try fixSideToEngineSide(try message.required(54));
         const order_id = try parsePositive(engine.OrderId, cl_ord_id);
@@ -163,9 +168,10 @@ const FixSession = struct {
             .price = try parsePositive(engine.Price, try message.required(44)),
             .quantity = try parsePositive(engine.Quantity, try message.required(38)),
         };
+        const pending_mapping = self.reserveMapping(cl_ord_id, instrument_id, order_id);
         const event = CommandEvent{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
         const sequenced = try self.applyAuthoritative(books, sequencer, segment, event);
-        try self.storeMapping(cl_ord_id, instrument_id, order_id);
+        self.commitMapping(pending_mapping);
         try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
     }
 
@@ -178,16 +184,17 @@ const FixSession = struct {
         message: *const FixMessage,
     ) !void {
         const cl_ord_id = try message.required(11);
+        try self.ensureMappingSlotAndLength(cl_ord_id);
         if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
-        try self.ensureCanStoreMapping(cl_ord_id);
         const orig_cl_ord_id = try message.required(41);
         const mapping = self.findMapping(orig_cl_ord_id) orelse return error.UnknownOrigClOrdID;
+        const pending_mapping = self.reserveMapping(cl_ord_id, mapping.instrument_id, mapping.order_id);
         const event = CommandEvent{ .cancel = .{
             .instrument_id = mapping.instrument_id,
             .order_id = mapping.order_id,
         } };
         const sequenced = try self.applyAuthoritative(books, sequencer, segment, event);
-        try self.storeMapping(cl_ord_id, mapping.instrument_id, mapping.order_id);
+        self.commitMapping(pending_mapping);
         try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
     }
 
@@ -279,13 +286,12 @@ const FixSession = struct {
         return null;
     }
 
-    fn ensureCanStoreMapping(self: *const FixSession, cl_ord_id: []const u8) !void {
+    fn ensureMappingSlotAndLength(self: *const FixSession, cl_ord_id: []const u8) !void {
         if (cl_ord_id.len > max_fix_cl_ord_id_len) return error.FixClOrdIDTooLong;
         if (self.mapping_count == self.mappings.len) return error.FixClOrdMapFull;
     }
 
-    fn storeMapping(self: *FixSession, cl_ord_id: []const u8, instrument_id: InstrumentId, order_id: engine.OrderId) !void {
-        try self.ensureCanStoreMapping(cl_ord_id);
+    fn reserveMapping(self: *const FixSession, cl_ord_id: []const u8, instrument_id: InstrumentId, order_id: engine.OrderId) PendingFixClOrdMapping {
         var mapping = FixClOrdMapping{
             .cl_ord_id = undefined,
             .cl_ord_id_len = cl_ord_id.len,
@@ -293,8 +299,12 @@ const FixSession = struct {
             .order_id = order_id,
         };
         @memcpy(mapping.cl_ord_id[0..cl_ord_id.len], cl_ord_id);
-        self.mappings[self.mapping_count] = mapping;
-        self.mapping_count += 1;
+        return .{ .index = self.mapping_count, .mapping = mapping };
+    }
+
+    fn commitMapping(self: *FixSession, pending: PendingFixClOrdMapping) void {
+        self.mappings[pending.index] = pending.mapping;
+        self.mapping_count = pending.index + 1;
     }
 };
 
@@ -713,6 +723,83 @@ test "FIX append failure prevents sequencing application mapping and output" {
     try expectOutput(&writer, "");
 }
 
+test "FIX overlong ClOrdID is rejected before authoritative submission" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        pub fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        pub fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
+    var books = BookSet.init();
+    const before = books;
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    try std.testing.expectError(
+        error.FixClOrdIDTooLong,
+        session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=123456789012345678901234567890123|55=NM1|54=1|44=100|38=5|"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), journal_segment.append_count);
+    try std.testing.expectEqual(@as(u64, 1), sequencer.next_sequence);
+    try std.testing.expectEqual(@as(usize, 0), session.mapping_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(&writer, "");
+}
+
+test "FIX mapping table full is rejected before authoritative submission" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        pub fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        pub fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
+    var books = BookSet.init();
+    const before = books;
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    while (session.mapping_count < session.mappings.len) : (session.mapping_count += 1) {
+        session.mappings[session.mapping_count] = .{
+            .cl_ord_id = undefined,
+            .cl_ord_id_len = 0,
+            .instrument_id = 1,
+            .order_id = 1,
+        };
+    }
+    try std.testing.expectError(
+        error.FixClOrdMapFull,
+        session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=1|44=100|38=5|"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), journal_segment.append_count);
+    try std.testing.expectEqual(@as(u64, 1), sequencer.next_sequence);
+    try std.testing.expectEqual(session.mappings.len, session.mapping_count);
+    try expectBooksEqual(&before, &books);
+    try expectOutput(&writer, "");
+}
 test "FIX output failure preserves committed command mapping state" {
     const CountingJournal = struct {
         append_count: usize = 0,
