@@ -795,6 +795,7 @@ const fix_version = "FIX.4.4";
 const fix_begin_string = "8=FIX.4.4";
 const fix_exchange_id = "NEONMATCH";
 const max_fix_fields = 32;
+const max_fix_cl_ord_id_len = 32;
 const max_fix_clord_mappings = engine.max_orders * max_instruments;
 
 const FixField = struct {
@@ -847,9 +848,14 @@ fn isFixDelimiter(byte: u8) bool {
 }
 
 const FixClOrdMapping = struct {
-    cl_ord_id: []const u8,
+    cl_ord_id: [max_fix_cl_ord_id_len]u8,
+    cl_ord_id_len: usize,
     instrument_id: InstrumentId,
     order_id: engine.OrderId,
+
+    fn clOrdId(self: *const FixClOrdMapping) []const u8 {
+        return self.cl_ord_id[0..self.cl_ord_id_len];
+    }
 };
 
 const FixSession = struct {
@@ -928,6 +934,7 @@ const FixSession = struct {
     ) !void {
         const cl_ord_id = try message.required(11);
         if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
+        try self.ensureCanStoreMapping(cl_ord_id);
         const instrument_id = try symbolToInstrumentId(try message.required(55));
         const side = try fixSideToEngineSide(try message.required(54));
         const order_id = try parsePositive(engine.OrderId, cl_ord_id);
@@ -938,8 +945,9 @@ const FixSession = struct {
             .quantity = try parsePositive(engine.Quantity, try message.required(38)),
         };
         const event = CommandEvent{ .submit_limit = .{ .instrument_id = instrument_id, .order = order } };
-        try self.applyAuthoritative(writer, books, sequencer, segment, event, cl_ord_id);
+        const sequenced = try self.applyAuthoritative(books, sequencer, segment, event);
         try self.storeMapping(cl_ord_id, instrument_id, order_id);
+        try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
     }
 
     fn handleOrderCancelRequest(
@@ -952,27 +960,26 @@ const FixSession = struct {
     ) !void {
         const cl_ord_id = try message.required(11);
         if (self.findMapping(cl_ord_id) != null) return error.DuplicateFixClOrdID;
+        try self.ensureCanStoreMapping(cl_ord_id);
         const orig_cl_ord_id = try message.required(41);
         const mapping = self.findMapping(orig_cl_ord_id) orelse return error.UnknownOrigClOrdID;
         const event = CommandEvent{ .cancel = .{
             .instrument_id = mapping.instrument_id,
             .order_id = mapping.order_id,
         } };
-        try self.applyAuthoritative(writer, books, sequencer, segment, event, cl_ord_id);
+        const sequenced = try self.applyAuthoritative(books, sequencer, segment, event);
         try self.storeMapping(cl_ord_id, mapping.instrument_id, mapping.order_id);
+        try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
     }
 
     fn applyAuthoritative(
-        self: *FixSession,
-        writer: *std.Io.Writer,
+        _: *FixSession,
         books: *BookSet,
         sequencer: *AuthoritativeSequencer,
         segment: anytype,
         event: CommandEvent,
-        cl_ord_id: []const u8,
-    ) !void {
-        const sequenced = try sequencer.submit(books, segment, event);
-        try self.writeExecutionReports(writer, cl_ord_id, sequenced.authoritative_sequence, &sequenced.result);
+    ) !SequencedCommandResult {
+        return sequencer.submit(books, segment, event);
     }
 
     fn writeExecutionReports(
@@ -1048,18 +1055,26 @@ const FixSession = struct {
         var index: usize = 0;
         while (index < self.mapping_count) : (index += 1) {
             const mapping = self.mappings[index];
-            if (std.mem.eql(u8, mapping.cl_ord_id, cl_ord_id)) return mapping;
+            if (std.mem.eql(u8, mapping.clOrdId(), cl_ord_id)) return mapping;
         }
         return null;
     }
 
-    fn storeMapping(self: *FixSession, cl_ord_id: []const u8, instrument_id: InstrumentId, order_id: engine.OrderId) !void {
+    fn ensureCanStoreMapping(self: *const FixSession, cl_ord_id: []const u8) !void {
+        if (cl_ord_id.len > max_fix_cl_ord_id_len) return error.FixClOrdIDTooLong;
         if (self.mapping_count == self.mappings.len) return error.FixClOrdMapFull;
-        self.mappings[self.mapping_count] = .{
-            .cl_ord_id = cl_ord_id,
+    }
+
+    fn storeMapping(self: *FixSession, cl_ord_id: []const u8, instrument_id: InstrumentId, order_id: engine.OrderId) !void {
+        try self.ensureCanStoreMapping(cl_ord_id);
+        var mapping = FixClOrdMapping{
+            .cl_ord_id = undefined,
+            .cl_ord_id_len = cl_ord_id.len,
             .instrument_id = instrument_id,
             .order_id = order_id,
         };
+        @memcpy(mapping.cl_ord_id[0..cl_ord_id.len], cl_ord_id);
+        self.mappings[self.mapping_count] = mapping;
         self.mapping_count += 1;
     }
 };
@@ -1829,6 +1844,75 @@ test "FIX append failure prevents sequencing application mapping and output" {
     try expectOutput(&writer, "");
 }
 
+test "FIX output failure preserves committed command mapping state" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var logon_output_buffer: [128]u8 = undefined;
+    var logon_writer = std.Io.Writer.fixed(&logon_output_buffer);
+
+    try session.handle(&logon_writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+
+    var tiny_output_buffer: [1]u8 = undefined;
+    var tiny_writer = std.Io.Writer.fixed(&tiny_output_buffer);
+    session.handle(&tiny_writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=D|34=2|49=CLIENT1|56=NEONMATCH|11=101|55=NM1|54=1|44=100|38=5|") catch |err| switch (err) {
+        error.WriteFailed => {},
+        else => return err,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), journal_segment.append_count);
+    try std.testing.expectEqual(@as(u64, 2), sequencer.next_sequence);
+    const book = try books.bookFor(1);
+    try std.testing.expect(book.containsOrder(101));
+    const mapping = session.findMapping("101") orelse return error.MissingFixClOrdMapping;
+    try std.testing.expectEqual(@as(InstrumentId, 1), mapping.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 101), mapping.order_id);
+}
+
+test "FIX ClOrdID mappings copy incoming message bytes" {
+    const CountingJournal = struct {
+        append_count: usize = 0,
+
+        fn appendSubmitLimit(self: *@This(), _: InstrumentId, _: engine.Order) !void {
+            self.append_count += 1;
+        }
+
+        fn appendCancel(self: *@This(), _: InstrumentId, _: engine.OrderId) !void {
+            self.append_count += 1;
+        }
+    };
+
+    var session = FixSession{};
+    var sequencer = AuthoritativeSequencer{};
+    var books = BookSet.init();
+    var journal_segment = CountingJournal{};
+    var output_buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buffer);
+    var message_buffer = [_]u8{ '8', '=', 'F', 'I', 'X', '.', '4', '.', '4', '|', '3', '5', '=', 'D', '|', '3', '4', '=', '2', '|', '4', '9', '=', 'C', 'L', 'I', 'E', 'N', 'T', '1', '|', '5', '6', '=', 'N', 'E', 'O', 'N', 'M', 'A', 'T', 'C', 'H', '|', '1', '1', '=', '3', '0', '1', '|', '5', '5', '=', 'N', 'M', '1', '|', '5', '4', '=', '1', '|', '4', '4', '=', '1', '0', '0', '|', '3', '8', '=', '5', '|' };
+
+    try session.handle(&writer, &books, &sequencer, &journal_segment, "8=FIX.4.4|35=A|34=1|49=CLIENT1|56=NEONMATCH|");
+    writer.end = 0;
+    try session.handle(&writer, &books, &sequencer, &journal_segment, message_buffer[0..]);
+    @memset(message_buffer[0..], 'X');
+
+    const mapping = session.findMapping("301") orelse return error.MissingFixClOrdMapping;
+    try std.testing.expectEqual(@as(InstrumentId, 1), mapping.instrument_id);
+    try std.testing.expectEqual(@as(engine.OrderId, 301), mapping.order_id);
+    try std.testing.expectEqualStrings("301", mapping.clOrdId());
+}
 test "invalid routed instruments are not journaled and do not mutate books" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
